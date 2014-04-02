@@ -1,0 +1,159 @@
+#!/usr/bin/env python
+################################################################################
+# A testbed environment for the m5mbridge module.
+#
+# This script provides an alternative way to invoke the m5mbridge. It can still
+# run the Hotspot and McPat simulators, but not the Gem5 simulator. If you need
+# to run the Gem5 simulator you must invoke m5mbridge from the Gem5 simulator
+# process.
+#
+# The main purpose of this script is for testing the m5mbridge module. As a
+# bonus you can also use it to playback some events, for example a stream of
+# recorded m5stats events to compute the accompanying pat (power, area, timing)
+# with McPat.
+#
+# For usage information see the --help output.
+#
+# Author: Sascha Friedmann                                         April 2012
+################################################################################
+
+## Make hotspot Python module visible
+import sys
+sys.path.append('../hotspot/testbed')
+
+## Command line argument parsing.
+
+try:
+    import argparse
+except ImportError:
+    import sys
+    print >>sys.stderr, "Sorry, but this script requires Python 2.7 or later."
+
+def colonSepList(str):
+    '''Return a list of non-empty words from a colon-separated word-string.'''
+    return filter(len, str.split(':'))
+
+def filePath(parser, arg):
+    "Check that argument value is a valid path and return that value."
+    from os import path
+    def checkFilePath(str):
+        if not path.exists(str):
+            parser.error("argument '{0}' requires a valid file path.".format(arg))
+        return str
+    return checkFilePath
+
+parser = argparse.ArgumentParser(
+    description='A testbed environment for the m5mbridge module.')
+parser.add = parser.add_argument
+# Optional arguments
+parser.add('-M', '--m5mbridge', action='append', default=[],
+           help="Optional argument to forward to the m5mbridge. These arguments overwrite the scripts' arguments.")
+parser.add('-X', '--debug',
+           help='Enable debugging for the given list of partrefs. Multiple partrefs must be separated by a colon.')
+parser.add('-v', '--verbose', action='store_true', default=False, dest='verbose',
+           help='Enable verbose event playback. Analogous to --debug=playback.')
+parser.add('-t', '--time-accurate', action='store_true', default=False,
+          help='Use time-accurate playback. The default is a maximum throughput time-inaccurate event playback.')
+parser.add('-E', '--events', action='store', type=colonSepList, default=['all'],
+           help='A list of events to play back. Multiple events must be separated by a colon. The default setting is to play back all events.')
+parser.add('-o', '--only-scheduled', action='store_true', default=False, dest='only_scheduled',
+           help="Don't replay recorded events. Only initialize m5mbridge and execute scheduled events. Together with --m5mbridge this allows to use the m5mbridge playback interface instead. The positional arguments are required, but not used if -o is used. You can pass for example '.' for both.")
+parser.add('-s', '--stats-file', action='store', default=None, type=filePath(parser, 'stats-file'),
+           help='Read the Gem5 stats dump from the given file and play them back. The generated events are recorded into the event-log positional argument. This mode is useful to convert stats dumps to an event log.')
+# (Required) positional arguments
+parser.add('config', type=filePath(parser, 'config'),
+           help='A Gem5 machine configuration ini file.')
+parser.add('event_log', type=filePath(parser, 'event-log'), metavar='event-log',
+           help='An event log that should be played back.')
+
+args = parser.parse_args()
+
+## Compile m5mbridge argument list
+
+import m5mbridge
+from m5mbridge import factory
+from m5mbridge.machine import options
+
+argv = ['--config_fn', args.config ]
+if args.verbose:
+    args.debug = args.debug or ''
+    args.debug += ':all.controller.playback'
+if args.debug:
+    argv.extend(['--debug', args.debug])
+if args.stats_file:
+    argv.extend(['--record=all', '--record-file', args.event_log])
+argv.extend(args.m5mbridge)
+
+## Instantiate m5mbridge
+
+import m5mbridge.entry
+
+m5mbridge.entry.initM5MBridge(argv)
+controller = m5mbridge.getController()
+
+## Setup event playback
+
+import m5.event
+from m5mbridge.controller import playback
+
+pbDevCreator = args.time_accurate and playback.timeAccuratePlaybackDevice or playback.simplePlaybackDevice
+
+def standardPlayback():
+    '''Play back recorded events. (The default mode.)'''
+
+    def updateMachine(controller, event, machine):
+        controller.machine = machine
+        controller.stateModified(event)
+
+    def createEvent(controller, event, machine):
+        if controller.machine:
+            controller.accessMachine(lambda c,m: updateMachine(c,event,machine))
+        else:
+            updateMachine(controller, event, machine)
+
+    pbDev = pbDevCreator(args.event_log, args.events, controller.getOptions())
+
+    # We don't know yet if the recorded events (and after event filtering) include
+    # a machineCreated event. If that's the case we don't have to create the machine,
+    # otherwise we have to before the first event is executed.
+
+    machineCreated = False
+    for (e,m) in pbDev:
+        # Start controller.tick() calls on machineCreated event.
+        if e == 'machineCreated' and not machineCreated:
+            m5mbridge.entry.startTicker(controller)
+            machineCreated = True
+        # We have to create the machine from the config file.
+        if not machineCreated:
+            factory.createMachine(controller)
+            m5mbridge.entry.startTicker(controller)
+            machineCreated = True
+
+        # Regular event processing
+        createEvent(controller, e, m)
+        # Do non-blocking event scheduling
+        m5.event.mainq.run()
+
+def processEvents():
+    '''Only perform event processing, no play back.'''
+    m5.event.mainq.runBlocking()
+
+def importStatsDumps():
+    '''Read the stats dumps from the given file and record the events.'''
+    from m5.stats import StatsDumpSimulator
+    dumpSim = StatsDumpSimulator(args.stats_file)
+    dumpSim.dumpAll()
+    mcpat = controller.getModule('mcpat')
+    while mcpat.requestsInFlight != 0:
+        processEvents()
+
+## Decide mode of operation
+
+if args.stats_file:
+    importStatsDumps()
+else:
+
+    if args.only_scheduled:
+        processEvents()
+    else:
+        standardPlayback()

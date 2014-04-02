@@ -1,0 +1,308 @@
+#!/usr/bin/env python
+
+"""
+SYNOPSIS
+
+    m5-mcpat-parse.py [-h] [-v,--verbose] [--version] [--process_run_dirs_by_filter="[some characteristic sub string]"]
+
+DESCRIPTION
+
+    m5-mcpat-parse.py is a script for parsing M5 output and generating
+    mcpat compatible xml. It is expected that you will want to modify
+    this script to be compatible with your particular system.
+
+    Assumptions:
+    (1) Inside the run directories, the stats file is found in
+        ./m5out/stats.txt
+    (2) Inside the run directories, the config file is found in
+        ./m5out/config.ini
+    (3) The cache stats are assuming that you are using Jiayuan's
+        directory cache coherence (You can easily change this)
+    (4) You are willing to sit down for a 1/2 hour to change any differences
+        your particular simulation model has.
+
+    Editing the code:
+
+    Note that comments are present in the code to direct your attention. #TODO
+    signifies that you should set the default value to match your systems parameters.
+    If you have added this system parameter to the config.ini file, then you
+    can put the related string filter in the m5_key field. #FIXME indicates
+    a stat that I was not sure about and that you should check if you notice
+    inconsistencies with expected behavior.
+
+    Likely, most of the changes you will add are in the functions addPower{Param|Stat}.
+    m5_key represents a unique string filter that identifies the stat in config.ini
+    or stats output file. power_key is the corresponding McPat interface id that
+    identifies the node in mcpat xml interface. By changing M5_keys, you can capture
+    stats and params that you require. If you realize that you need to capture a stat
+    that is dependent on other stats, please look at the function generateCalcStats()
+    for an example of how to add calculated stats
+
+EXAMPLES
+
+    (1) To parse the current m5 run directory: $m50mcpat-parse.py
+    (2) To parse all m5 run directories that begin with the prefix 'run:' with verbose output
+     and meeting the assumptions above: $m5-mcpat-parse.py --process_run_dirs_by_filter="run:" -v
+
+EXIT STATUS
+
+    TODO: add exit code meanings
+    (0) success with no errors
+    (1) unable to find component
+    (2) unable to handle multiple clock domains yet
+    (3) cht does not have the key I generated for detailed cpu
+    (4) child_id does not exist
+    (5) child_id does not exist
+    (6) parsed invalid stat
+    (7) Identical component id occurs twice! Invalid Config
+    (8) unable to perform conversion
+
+AUTHOR
+
+    Richard Strong <rstrong@cs.ucsd.edu>
+
+LICENSE
+
+    Copyright (c) [2009], Richard Strong <rstrong@cs.ucsd.edu>
+
+    Permission to use, copy, modify, and/or distribute this software for any
+    purpose with or without fee is hereby granted, provided that the above
+    copyright notice and this permission notice appear in all copies.
+
+    THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES
+    WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF
+    MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR
+    ANY SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES
+    WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN
+    ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
+    OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
+
+VERSION
+
+    0.5 Alpha.
+"""
+## Make hotspot Python module visible
+import sys
+sys.path.append('../hotspot/testbed')
+
+import os
+import traceback
+import optparse
+import time
+import re
+
+from m5mbridge.machine.component import Component
+from m5mbridge.machine.component import SystemComponent
+from m5mbridge.machine import Machine
+from m5mbridge.machine.translator import Translator
+from m5mbridge.modules.m5.importer.translatorfactory import TranslatorFactory
+
+from m5mbridge import warning, panic
+
+
+machine = None
+
+
+
+'''
+find the voltage scaling for a frequency scaling for data:
+from Gaurav Dhiman's Hotpower paper
+DFS	        FREQ	VOLT	PERC_VOLT
+1	        2600	1.25	1
+0.730769231	1900	1.15	0.92
+0.538461538	1400	1.05	0.84
+0.307692308	800	    0.9	    0.72
+dvs = 0.4032*dfs + 0.6102
+'''
+def dfsToDvs(dfs):
+    dvs = 0.4032*dfs + 0.6102
+    return dvs
+
+
+'''
+run() is repsonsible for going through all the directories
+that have results, creating paths to all important files,
+and calling parseSystemConfig that handles the power.xml
+creation.
+'''
+def run():
+    global options
+    filter = ""
+    if options.process_run_dirs_by_filter != None:
+        dirs = os.listdir('.')
+        filter = options.process_run_dirs_by_filter
+    else:
+        dirs = '.'
+
+    for dir in dirs:
+        if filter not in dir:
+            continue
+
+        if options.do_vdd_scaling and "1core:dfs" in dir:
+            match = re.match("run.*:1core:dfs([0-9]+)",dir)
+            assert(match)
+            dfs = int(match.group(1))/100.0
+            dvs = dfsToDvs(dfs)
+            options.sys_vdd_scale = str(dvs)
+        else:
+            options.sys_vdd_scale = None
+        component_hash = {}
+        stats_hash = {}
+        if options.verbose:
+            print "processing:%s" %(dir)
+        if options.m5dir:
+            if os.path.exists(options.m5dir):
+                output_dir=options.m5dir
+            else:
+               panic("m5 output directory '%s' does not exist!" % options.m5dir)
+        else:
+            output_dir="m5out"
+        if not os.path.exists(os.path.join(dir,output_dir)):
+          output_dir=""
+
+        config_file_path = os.path.join(dir, output_dir,options.config_fn)
+
+        if options.stats_fn == '/dev/stdin':
+            stat_file_path = options.stats_fn
+        elif options.stats_fn:
+            stat_file_path = os.path.join(dir, output_dir, options.stats_fn)
+        else:
+            stat_file_path = None
+
+        if options.summary_fn:
+            out_file_path = os.path.join(dir, options.summary_fn)
+        else:
+            out_file_path = None
+        out_file_path_2 = os.path.join(dir, options.power_fn)
+        if not os.path.exists(config_file_path):
+            warning("config file does not exist:%s" % (config_file_path))
+        if stat_file_path and not os.path.exists(stat_file_path):
+            warning("stat path does not exist:%s" % (stat_file_path))
+        parseSystemConfig(config_file_path, stat_file_path, out_file_path, out_file_path_2, component_hash, stats_hash)
+
+
+
+
+
+'''
+genComponentXml is responsible for generating summary.xml,
+the intermediate form for power.xml
+'''
+def genComponentXml(root_component, out_path):
+    import xml.dom.minidom
+    global options
+    from m5mbridge.modules.mcpat.exporter.tree2xml import Tree2XmlVisitor
+    doc = xml.dom.minidom.Document()
+
+    serializer = Tree2XmlVisitor(doc, options)
+    global machine
+    machine.visit(serializer)
+    if options.verbose:
+        print "writing:%s" %(out_path)
+    f = open(out_path, 'w')
+    f.write(doc.toprettyxml())
+    f.close()
+
+'''
+genPowerXml is responsible for generating power.xml,
+the interface for McPat
+'''
+def genPowerXml(root_component, out_path):
+    import xml.dom.minidom
+    global options
+    doc = xml.dom.minidom.Document()
+
+    from m5mbridge.modules.mcpat.exporter.prunetree import PruneChildrenForMcPatVisitor
+    global machine
+    machine.visit(PruneChildrenForMcPatVisitor(options))
+
+    from m5mbridge.modules.mcpat.exporter.tree2mcpat import DefaultOutputFilter
+    machine.visit(DefaultOutputFilter(options))
+
+    from m5mbridge.modules.mcpat.exporter.tree2mcpat import Tree2McPatVisitor
+    from m5mbridge.modules.mcpat.exporter.tree2mcpat import MachineConfigGenerator
+    from m5mbridge.modules.mcpat.exporter.tree2mcpat import MachineStatsGenerator
+
+    contentCreators = []
+
+    for generator in options.power_output.split(','):
+        if generator == 'systemConfig':
+            contentCreators.append(MachineConfigGenerator(doc))
+        elif generator == 'systemStats':
+            contentCreators.append(MachineStatsGenerator(doc))
+
+    visitor = Tree2McPatVisitor(doc, contentCreators, options)
+    machine.visit(visitor)
+    if options.verbose:
+        print "writing:%s" %(out_path)
+    f = open(out_path, 'w')
+    f.write(doc.toprettyxml())
+    f.close()
+
+'''
+parseSystemConfig is repsonsible for creating a component dictionary, a statisitic dictionary, and
+then using this two structures to build a an internal tree of component objects that contain
+fields with their parameters and statistics.
+@config_file_path string to the config.ini file
+@stats_file_path string to the stat file path
+@out_file_path path to put the summary.xml file that is the intermediate of the power.xml file
+@out_file_path_2 path to put the power.xml file
+@cht dictionary that contains all component keys and their associated objects.
+@sht dictionary that contains all stat keys and their associated stat objects.
+'''
+def parseSystemConfig(config_file_path, stats_file_path, out_file_path, out_file_path_2, cht, sht):
+    global options
+    global machine
+    from  m5mbridge.modules.m5.importer import machinefactory
+
+    global machine
+    machine = machinefactory.createFromConfigFile(config_file_path, options)
+
+    from m5mbridge.modules.m5.importer import stats
+
+    if stats_file_path:
+        stats.importStatsFromFile(stats_file_path, machine)
+
+    #generate the intermediate xml summary.xml
+    if out_file_path:
+        genComponentXml(machine.tree, out_file_path)
+    #generate the McPat power.xml
+    genPowerXml(machine.tree, out_file_path_2)
+
+def main ():
+    global options, args
+
+    # TODO: Do something more interesting here...
+    if options.verbose:
+        print 'm5-mcpat-parser'
+        print '...'
+
+    run()
+
+if __name__ == '__main__':
+    try:
+        start_time = time.time()
+
+        from m5mbridge.machine import options
+
+        options = options.parse(sys.argv, globals()['__doc__'])
+
+        if options.verbose: print time.asctime()
+        exit_code = main()
+        if exit_code is None:
+            exit_code = 0
+        if options.verbose: print time.asctime()
+        if options.verbose: print 'TOTAL TIME IN MINUTES:',
+        if options.verbose: print (time.time() - start_time) / 60.0
+        sys.exit(exit_code)
+    except KeyboardInterrupt, e: # Ctrl-C
+        raise e
+    except SystemExit, e: # sys.exit()
+        raise e
+    except Exception, e:
+        print 'ERROR, UNEXPECTED EXCEPTION'
+        print str(e)
+        traceback.print_exc()
+        os._exit(1)
+
+# vim:set sr et ts=4 sw=4 ft=python : // See Vim, :help 'modeline'

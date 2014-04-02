@@ -1,0 +1,2112 @@
+#!/usr/bin/env python
+
+"""
+SYNOPSIS
+
+    m5-mcpat-parse.py [-h] [-v,--verbose] [--version] [--process_run_dirs_by_filter="[some characteristic sub string]"]
+
+DESCRIPTION
+
+    m5-mcpat-parse.py is a script for parsing M5 output and generating
+    mcpat compatible xml. It is expected that you will want to modify
+    this script to be compatible with your particular system.
+
+    Assumptions:
+    (1) Inside the run directories, the stats file is found in
+        ./m5out/stats.txt
+    (2) Inside the run directories, the config file is found in
+        ./m5out/config.ini
+    (3) The cache stats are assuming that you are using Jiayuan's
+        directory cache coherence (You can easily change this)
+    (4) You are willing to sit down for a 1/2 hour to change any differences
+        your particular simulation model has.
+
+    Editing the code:
+
+    Note that comments are present in the code to direct your attention. #TODO
+    signifies that you should set the default value to match your systems parameters.
+    If you have added this system parameter to the config.ini file, then you
+    can put the related string filter in the m5_key field. #FIXME indicates
+    a stat that I was not sure about and that you should check if you notice
+    inconsistencies with expected behavior.
+
+    Likely, most of the changes you will add are in the functions addPower{Param|Stat}.
+    m5_key represents a unique string filter that identifies the stat in config.ini
+    or stats output file. power_key is the corresponding McPat interface id that
+    identifies the node in mcpat xml interface. By changing M5_keys, you can capture
+    stats and params that you require. If you realize that you need to capture a stat
+    that is dependent on other stats, please look at the function generateCalcStats()
+    for an example of how to add calculated stats
+
+EXAMPLES
+
+    (1) To parse the current m5 run directory: $m50mcpat-parse.py
+    (2) To parse all m5 run directories that begin with the prefix 'run:' with verbose output
+     and meeting the assumptions above: $m5-mcpat-parse.py --process_run_dirs_by_filter="run:" -v
+
+EXIT STATUS
+
+    TODO: add exit code meanings
+    (0) success with no errors
+    (1) unable to find component
+    (2) unable to handle multiple clock domains yet
+    (3) cht does not have the key I generated for detailed cpu
+    (4) child_id does not exist
+    (5) child_id does not exist
+    (6) parsed invalid stat
+    (7) Identical component id occurs twice! Invalid Config
+    (8) unable to perform conversion
+
+AUTHOR
+
+    Richard Strong <rstrong@cs.ucsd.edu>
+
+LICENSE
+
+    Copyright (c) [2009], Richard Strong <rstrong@cs.ucsd.edu>
+
+    Permission to use, copy, modify, and/or distribute this software for any
+    purpose with or without fee is hereby granted, provided that the above
+    copyright notice and this permission notice appear in all copies.
+
+    THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES
+    WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF
+    MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR
+    ANY SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES
+    WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN
+    ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
+    OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
+
+VERSION
+
+    0.5 Alpha.
+"""
+
+import sys
+import os
+import traceback
+import optparse
+import time
+import re
+import math
+
+
+def panic(msg, code=9):
+    print "Error:%s" % (msg)
+    os.sys.exit(code)
+
+def warning(msg):
+    global options
+    if options.verbose:
+        print "Warning:%s" %(msg)
+
+def findBenchmarkTestSystem(benchmark):
+    panic("Not used. I am wondering if I should set options.system_name")
+    global options
+    test_system=options.system_name
+
+    if benchmark=="maerts" or benchmark=="stream":
+        warning("chaging system name for stats of interest to 'client'")
+        test_system="client"
+    if benchmark=="webnew":
+        warning("changing system name for stats of interest to 'server'")
+        test_system="server"
+
+    options.system_name=test_system
+    return test_system
+
+def sortComponentList(components):
+    names=[]
+    temp_hash={}
+    for comp in components:
+        names.append(comp.name)
+        temp_hash[comp.name]=comp
+
+    names.sort()
+    ret=[]
+    for comp_name in names:
+        ret.append(temp_hash[comp_name])
+
+
+    return ret
+
+class Component:
+    UNKNOWN=None
+    CORE=1
+    FILTER_TYPES = ["Tsunami"\
+                   , "IsaFake"\
+                   , "SimpleDisk"\
+                   , "Terminal"\
+                   , "Crossbar"\
+                   , "IntrControl"\
+                   , "IdeDisk"\
+                   , "ExeTracer"\
+                   , "AlphaInterrupts"\
+                   , "Tracer"\
+                   , "Bridge"\
+                   , "AtomicSimpleCPU"\
+                   , "FUPool"\
+                   , "BusConn"]
+
+    def __init__(self, id, params, name=None):
+        temp = id.split('.')
+        if name==None:
+            self.name = temp[len(temp)-1] #last field specifies what this component is
+        else:
+            self.name=name
+        self.id = id
+        self.params = params
+        self.re_id=None
+        self.re_name=None
+        self.translated_params = {}
+        self.translated_params_order = []
+        self.children = []
+        self.statistics = {}
+        self.translated_statistics = {}
+        self.calc_statistics = {}
+        self.translator = Component.UNKNOWN
+        self.power_xml_filter=False
+        self.translated_statistics_order=[]
+
+    def formXml(self, parent_node, doc):
+        if options.verbose:
+            print "Generating summary component ", self.name
+
+        new_component = doc.createElement("component")
+        parent_node.appendChild(new_component)
+        new_component.setAttribute("id", self.id)
+        new_component.setAttribute("name", self.name)
+
+        #add params settings
+        for param_key in self.params:
+            new_param = doc.createElement("param")
+            new_param.setAttribute("name", param_key)
+            new_param.setAttribute("value", self.params[param_key])
+            new_component.appendChild(new_param)
+
+        #add statistics
+        for stat_key in self.statistics:
+            new_stat = doc.createElement("stat")
+            new_stat.setAttribute("name", stat_key)
+            new_stat.setAttribute("value", self.statistics[stat_key])
+            new_component.appendChild(new_stat)
+
+        #add architectural stats for this level.
+        for child in self.children:
+            child.formXml(new_component, doc)
+
+    def selectChildrenForXmlInclusion(self):
+        '''
+            Select children which must be included in the power XML files.
+
+            You must call this function prior to calling either formXmlSystemConfig() or formXmlSystemStats().
+        '''
+        global options
+
+        #add architectural stats for this level.
+        #re-order children for xml output
+        if self.name == options.system_name:
+            new_children=[]
+            #add cores
+            filters=[options.cpu_name, "L1Directory", "L2Directory", "l2", "l3","tol2bus","tol3bus","NoC", "physmem", "mc", "niu","pcie","flashc"]
+            unfilters=[None,None,None, "Directory", "Directory", None, None, None, None,None,None,None,None,None]
+            unfilters2=[None,None,None, "bus", "bus", None, None, None, None,None,None,None,None,None]
+
+            filter_pair=zip(filters, unfilters, unfilters2)
+            for filter, unfilter, unfilter2 in filter_pair:
+                temp_new=[]
+                for child in self.children:
+                    if filter in child.name:
+                        if (unfilter==None or unfilter not in child.name)\
+                            and (unfilter2==None or unfilter2 not in child.name):
+                            #print "filter:%s unfilter:%s unfilter2:%s child.name:%s"%(filter, unfilter, unfilter2, child.name)
+                            temp_new.append(child)
+
+                new_children += sortComponentList(temp_new)
+
+            self.children=new_children
+
+        if self.params.has_key('type') and (self.params['type'] == "DerivO3CPU" or self.params['type'] == "TimingSimpleCPU"):
+            new_children=[]
+            #add cores
+            filters=["PBT", options.itb_name, "icache", options.dtb_name, "dcache", "BTB"]
+            unfilters=[None, None, None, None, None, None]
+            filter_pair=zip(filters, unfilters)
+            for filter, unfilter in filter_pair:
+                temp_new=[]
+                for child in self.children:
+                    if filter in child.name:
+                        temp_new.append(child)
+                new_children += sortComponentList(temp_new)
+
+            self.children=new_children
+
+        # Recurse to unfiltered children
+        for child in self.children:
+            child.selectChildrenForXmlInclusion()
+
+    def __formXmlCreateComponent(self, parent_node, doc):
+        new_component = doc.createElement("component")
+
+        parent_node.appendChild(new_component)
+
+        if self.re_id == None:
+            new_component.setAttribute("id", self.id)
+        else:
+            new_component.setAttribute("id", self.re_id)
+        if self.re_name == None:
+            new_component.setAttribute("name", self.name)
+        else:
+            new_component.setAttribute("name", self.re_name)
+
+        return new_component
+
+    def createSystemConfig(self, component, doc):
+        #add params settings
+        for param_key in self.translated_params_order:
+            new_param = doc.createElement("param")
+            new_param.setAttribute("name", param_key)
+            new_param.setAttribute("value", self.translated_params[param_key])
+            component.appendChild(new_param)
+
+    def createSystemStats(self, component, doc):
+        #add statistics
+        for stat_key in self.translated_statistics_order:
+            new_stat = doc.createElement("stat")
+            new_stat.setAttribute("name", stat_key)
+            new_stat.setAttribute("value", self.translated_statistics[stat_key])
+            component.appendChild(new_stat)
+
+    def __call(self, method_name, *args):
+        '''Call the method named 'method_name' with the given arguments.'''
+        m = getattr(self, method_name)
+        m(*args)
+
+    def createContent(self, contentCreators, new_component, doc):
+        for contentCreator in contentCreators:
+            self.__call(contentCreator, new_component, doc)
+
+    def formXmlPower(self, parent_node, doc, contentCreators):
+        global options
+
+        if self.power_xml_filter == True:
+            return
+        if options.verbose:
+            print "Generating system config component ", self.name
+
+        new_component = self.__formXmlCreateComponent(parent_node, doc)
+
+        self.createContent(contentCreators, new_component, doc)
+
+        for child in self.children:
+            child.formXmlPower(new_component, doc, contentCreators)
+
+    '''
+    checkToFilter() is responsible for seeing the current component
+    should be filtered from the power xml file.
+    '''
+    def checkToFilter(self):
+        global options
+        ptype = self.params['type']
+        for f in self.FILTER_TYPES:
+            if ptype == f:
+                self.power_xml_filter=True
+
+        if "TimingSimpleCPU" in self.params['type'] and options.cpu_name not in self.name:
+            self.power_xml_filter=True
+
+        if "iocache" in self.name:
+            self.power_xml_filter=True
+
+        if "server" in self.name:
+            self.power_xml_filter=True
+
+        if "client" in self.name:
+            self.power_xml_filter=True
+
+        if "etherdump" in self.name or "etherlink" in self.name:
+            self.power_xml_filter=True
+
+    def checkToRenameReid(self):
+        global options
+        ptype = self.params['type']
+        if options.cpu_name in self.name:
+            self.re_name=self.name.replace(options.cpu_name, "core")
+            self.re_id=self.id.replace(options.cpu_name, "core")
+
+        if ptype == 'AlphaTLB':
+            if self.name==options.itb_name:
+                self.re_name=self.name.replace(options.itb_name,"itlb").replace(options.cpu_name, "core")
+                self.re_id=self.id.replace(options.itb_name, "itlb").replace(options.cpu_name, "core")
+            else:
+                self.re_name=self.name.replace(options.dtb_name,"dtlb").replace(options.cpu_name, "core")
+                self.re_id=self.id.replace(options.dtb_name, "dtlb").replace(options.cpu_name, "core")
+
+        if ptype == 'Mesh2D':
+            None
+            #for pair in options.interconn_names.split('#'):
+            #    name, util = pair.split(',')
+            #    if name in self.name:
+            #        self.re_name = self.name.replace(name, "noc0")
+            #        self.re_id = self.id.replace(name, "NoC0")
+
+
+        if ptype == "BaseCache" and ('icache' in self.name or 'dcache' in self.name):
+            self.re_name=self.name.replace(options.l1_cache_cpu_name, "core")
+            self.re_id=self.id.replace(options.l1_cache_cpu_name, "core")
+
+
+
+'''
+The <system>-component in the McPAT XML file includes some <param>-components
+that are needed by the parser in McPAT. Thus, this script must print these
+components always, even if the user only wants an XML file that includes just
+the <stat>-components.
+'''
+class SystemComponent(Component):
+    def createContent(self, contentCreators, new_component, doc):
+        if not "createSystemConfig" in contentCreators:
+            contentCreators = list(contentCreators)
+            contentCreators.append("createSystemConfig")
+        Component.createContent(self, contentCreators, new_component, doc)
+
+'''
+class Translator is used for finding and adding params and stats
+to the xml. Define a translator for each unique component in your system
+and make sure you add the assignment of the translator in setComponentType
+'''
+class Translator:
+    M5_PARAM=0
+    CONVERSION=1
+    DEFAULT_VALUE=2
+    M5_STAT=3
+
+    __component_class = {}
+
+    @staticmethod
+    def registerComponentClass(name, cls):
+        Translator.__component_class[name] = cls
+
+    @staticmethod
+    def createComponent(id, *args):
+        name = id.split('.')[-1]
+        if name in Translator.__component_class:
+            return Translator.__component_class[name](id, *args)
+        else:
+            return Component(id, *args)
+
+    def __init__(self):
+        self.power_params_order = []
+        self.power_params = {}
+        self.power_statistics = {}
+        self.power_statistics_order = []
+        None
+
+    def addPowerParam(self, power_key, m5_key, default_value="NaV"):
+        if not self.power_params.has_key(power_key):
+            self.power_params_order.append(power_key)
+        self.power_params[power_key] = {Translator.M5_PARAM: m5_key, Translator.DEFAULT_VALUE: default_value}
+
+    def addPowerStat(self, power_key, m5_key, default_value="NaV"):
+        if not self.power_statistics.has_key(power_key):
+            self.power_statistics_order.append(power_key)
+        self.power_statistics[power_key] = {Translator.M5_STAT: m5_key, Translator.DEFAULT_VALUE: default_value}
+
+    '''
+    translate_params(component) translates all params in component object
+    from m5 parameters to the equivalent power model name
+    '''
+    def translate_params(self, component):
+        for power_param_key in self.power_params_order:
+            power_param = self.power_params[power_param_key]
+            #grab M5's version of the parameter needed and translate it to power file name
+            self.translate_param(component, power_param, power_param_key)
+    '''
+    translate_param(component, power_param) responsible for translating one M5 parameter
+    to an m5 parameter and adding that parameter to the component translated_params variable
+    '''
+    def translate_param(self, component, power_param, key):
+        #find the translated value if it exists
+        component.translated_params_order.append(key)
+        try:
+            component.translated_params[key] = component.params[power_param[Translator.M5_PARAM]]
+        except:
+            #if it doesn't exist, use a default value
+            component.translated_params[key] = power_param[Translator.DEFAULT_VALUE]
+
+    '''
+    translate_statistics(component) translates all statistics in component object
+    from m5 statistics to the equivalent power model statistics
+    '''
+    def translate_statistics(self, component):
+        for power_stat_key in self.power_statistics_order:
+            power_stat = self.power_statistics[power_stat_key]
+            #grab M5's version of the statistic needed and translate it to power file stat
+            self.translate_statistic(component, power_stat, power_stat_key)
+
+    '''
+    translate_statistc(component, power_param) responsible for translating one M5 statistic
+    to a m5 statistic and adding that parameter to the component translated_statistics variable
+    '''
+    def translate_statistic(self, component, power_stat, key):
+        #find the translated value if it exists
+        component.translated_statistics_order.append(key)
+        try:
+            component.translated_statistics[key] = component.statistics[power_stat[Translator.M5_STAT]]
+        except:
+            #if it doesn't exist, use a default value
+            component.translated_statistics[key] = power_stat[Translator.DEFAULT_VALUE]
+
+
+class InOrderCore(Translator):
+    def __init__(self):
+        Translator.__init__(self)
+        #reverse translation from m5 params to power params
+        #params
+        self.addPowerParam(power_key="clock_rate", m5_key="clockrate", default_value="NaV")
+        self.addPowerParam(power_key="instruction_length", m5_key="unknown", default_value="32") #TODO: set your value
+        self.addPowerParam(power_key="opcode_width", m5_key="unknown", default_value="7") #TODO: set your value
+        self.addPowerParam(power_key="machine_type", m5_key="unknown", default_value="1") # 1 for inorder
+        self.addPowerParam(power_key="number_hardware_threads", m5_key="numThreads", default_value="1")
+        self.addPowerParam(power_key="fetch_width", m5_key="unknown", default_value="2") #TODO: set your value
+        self.addPowerParam(power_key="number_instruction_fetch_ports", m5_key="unknown", default_value="1") #TODO: set your value
+        self.addPowerParam(power_key="decode_width", m5_key="unknown", default_value="1") #TODO: set your value
+        self.addPowerParam(power_key="issue_width", m5_key="unknown", default_value="1") #TODO: set your value
+        self.addPowerParam(power_key="commit_width", m5_key="unknown", default_value="1") #TODO: set your value
+        self.addPowerParam(power_key="fp_issue_width", m5_key="unknown", default_value="1") #TODO: set your value
+        self.addPowerParam(power_key="prediction_width", m5_key="unknown", default_value="1") #TODO: set your value
+        self.addPowerParam(power_key="pipelines_per_core", m5_key="unknown", default_value="1,1") #TODO: set your value
+        self.addPowerParam(power_key="pipeline_depth", m5_key="unknown", default_value="7,10") #TODO: set your value
+        self.addPowerParam(power_key="ALU_per_core", m5_key="unknown", default_value="2") #TODO: set your value
+        self.addPowerParam(power_key="MUL_per_core", m5_key="unknown", default_value="1") #TODO: set your value
+        self.addPowerParam(power_key="FPU_per_core", m5_key="unknown", default_value="1") #TODO: set your value
+        self.addPowerParam(power_key="instruction_buffer_size", m5_key="unknown", default_value="32") #TODO: set your value
+        self.addPowerParam(power_key="decoded_stream_buffer_size", m5_key="unknown", default_value="16") #TODO: set your value
+        self.addPowerParam(power_key="instruction_window_scheme", m5_key="unknown", default_value="0") #TODO: set your value
+        self.addPowerParam(power_key="instruction_window_size", m5_key="unknown", default_value="16")
+        self.addPowerParam(power_key="fp_instruction_window_size", m5_key="unknown", default_value="16")
+        self.addPowerParam(power_key="ROB_size", m5_key="unknown", default_value="80")
+        self.addPowerParam(power_key="archi_Regs_IRF_size", m5_key="unknown", default_value="32") #TODO: set your value
+        self.addPowerParam(power_key="archi_Regs_FRF_size", m5_key="unknown", default_value="32") #TODO: set your value
+        self.addPowerParam(power_key="phy_Regs_IRF_size", m5_key="unknown", default_value="32")
+        self.addPowerParam(power_key="phy_Regs_FRF_size", m5_key="unknown", default_value="32")
+        self.addPowerParam(power_key="rename_scheme", m5_key="unknown", default_value="0")
+        self.addPowerParam(power_key="register_windows_size", m5_key="unknown", default_value="0")
+        self.addPowerParam(power_key="LSU_order", m5_key="unknown", default_value="inorder") #TODO: set your value
+        self.addPowerParam(power_key="store_buffer_size", m5_key="unknown", default_value="64")
+        self.addPowerParam(power_key="load_buffer_size", m5_key="unknown", default_value="0")
+        self.addPowerParam(power_key="memory_ports", m5_key="unknown", default_value="1") #TODO: set your value
+        self.addPowerParam(power_key="RAS_size", m5_key="unknown", default_value="32")
+
+        #statistics
+        self.addPowerStat(power_key="total_instructions", m5_key="committedInsts", default_value="0")
+        self.addPowerStat(power_key="int_instructions", m5_key="num_int_insts", default_value="0")
+        self.addPowerStat(power_key="fp_instructions", m5_key="num_fp_insts", default_value="0")
+        self.addPowerStat(power_key="branch_instructions", m5_key="num_conditional_control_insts", default_value="0") # TODO: check this
+        self.addPowerStat(power_key="branch_mispredictions", m5_key="unknown", default_value="0") # TODO: set your value
+        if options.old_m5_stats:
+            self.addPowerStat(power_key="load_instructions", m5_key="load_insts", default_value="0")
+            self.addPowerStat(power_key="store_instructions", m5_key="store_insts", default_value="0")
+        else:
+            self.addPowerStat(power_key="load_instructions", m5_key="num_load_insts", default_value="0")
+            self.addPowerStat(power_key="store_instructions", m5_key="num_store_insts", default_value="0")
+
+        self.addPowerStat(power_key="committed_instructions", m5_key="num_insts", default_value="0")
+        self.addPowerStat(power_key="committed_int_instructions", m5_key="num_int_insts", default_value="0")
+        self.addPowerStat(power_key="committed_fp_instructions", m5_key="num_fp_insts", default_value="0")
+        self.addPowerStat(power_key="pipeline_duty_cycle", m5_key="unknown", default_value="0.5") #TODO: set your value
+        self.addPowerStat(power_key="total_cycles", m5_key="numCycles", default_value="0")
+        self.addPowerStat(power_key="idle_cycles", m5_key="num_idle_cycles", default_value="0") #FIXME
+        self.addPowerStat(power_key="busy_cycles", m5_key="num_busy_cycles", default_value="0") #FIXME
+        self.addPowerStat(power_key="ROB_reads", m5_key="unknown", default_value="0")
+        self.addPowerStat(power_key="ROB_writes", m5_key="unknown", default_value="0")
+        self.addPowerStat(power_key="rename_accesses", m5_key="unknown", default_value="0")
+        self.addPowerStat(power_key="fp_rename_accesses", m5_key="unknown", default_value="0")
+        self.addPowerStat(power_key="inst_window_reads", m5_key="unknown", default_value="0")
+        self.addPowerStat(power_key="inst_window_writes", m5_key="unknown", default_value="0")
+        self.addPowerStat(power_key="inst_window_wakeup_access", m5_key="unknown", default_value="0")
+        self.addPowerStat(power_key="fp_inst_window_reads", m5_key="unknown", default_value="0")
+        self.addPowerStat(power_key="fp_inst_window_writes", m5_key="unknown", default_value="0")
+        self.addPowerStat(power_key="fp_inst_window_wakeup_access", m5_key="unknown", default_value="0")
+        self.addPowerStat(power_key="int_regfile_reads", m5_key="num_int_register_reads", default_value="0")
+        if options.old_m5_stats:
+            self.addPowerStat(power_key="float_regfile_reads", m5_key="num_float_register_reads", default_value="0")
+        else:
+            self.addPowerStat(power_key="float_regfile_reads", m5_key="num_fp_register_reads", default_value="0")
+        self.addPowerStat(power_key="int_regfile_writes", m5_key="num_int_register_writes", default_value="0")
+        if options.old_m5_stats:
+            self.addPowerStat(power_key="float_regfile_writes", m5_key="num_float_register_writes", default_value="0")
+        else:
+            self.addPowerStat(power_key="float_regfile_writes", m5_key="num_fp_register_writes", default_value="0")
+        self.addPowerStat(power_key="function_calls", m5_key="num_func_calls", default_value="0")
+        self.addPowerStat(power_key="context_switches", m5_key="kern.swap_context", default_value="0")
+        if options.old_m5_stats:
+            self.addPowerStat(power_key="ialu_accesses", m5_key="num_ialu_accesses", default_value="0")
+            self.addPowerStat(power_key="fpu_accesses", m5_key="num_falu_accesses", default_value="0")
+        else:
+            self.addPowerStat(power_key="ialu_accesses", m5_key="num_int_alu_accesses", default_value="0")
+            self.addPowerStat(power_key="fpu_accesses", m5_key="num_fp_alu_accesses", default_value="0")
+        self.addPowerStat(power_key="mul_accesses", m5_key="unknown", default_value="0") #TODO: FIXME
+        if options.old_m5_stats:
+            self.addPowerStat(power_key="cdb_alu_accesses", m5_key="num_ialu_accesses", default_value="0")
+            self.addPowerStat(power_key="cdb_mul_accesses", m5_key="unknown", default_value="0") #TODO: FIXME
+            self.addPowerStat(power_key="cdb_fpu_accesses", m5_key="num_falu_accesses", default_value="0")
+        else:
+            self.addPowerStat(power_key="cdb_alu_accesses", m5_key="num_int_alu_accesses", default_value="0")
+            self.addPowerStat(power_key="cdb_mul_accesses", m5_key="unknown", default_value="0") #TODO: FIXME
+            self.addPowerStat(power_key="cdb_fpu_accesses", m5_key="num_fp_alu_accesses", default_value="0")
+        #DO NOT CHANGE BELOW UNLESS YOU KNOW WHAT YOU ARE DOING
+        self.addPowerStat(power_key="IFU_duty_cycle", m5_key="unknown", default_value="0.5")
+        self.addPowerStat(power_key="LSU_duty_cycle", m5_key="unknown", default_value="0.25")
+        self.addPowerStat(power_key="MemManU_I_duty_cycle", m5_key="unknown", default_value="0.5")
+        self.addPowerStat(power_key="MemManU_D_duty_cycle", m5_key="unknown", default_value="0.25")
+        self.addPowerStat(power_key="ALU_duty_cycle", m5_key="unknown", default_value="0.9")
+        self.addPowerStat(power_key="MUL_duty_cycle", m5_key="unknown", default_value="0")
+        self.addPowerStat(power_key="FPU_duty_cycle", m5_key="unknown", default_value="0.6")
+        self.addPowerStat(power_key="ALU_cdb_duty_cycle", m5_key="unknown", default_value="0.9")
+        self.addPowerStat(power_key="MUL_cdb_duty_cycle", m5_key="unknown", default_value="0")
+        self.addPowerStat(power_key="FPU_cdb_duty_cycle", m5_key="unknown", default_value="0.6")
+
+
+class OOOCore(Translator):
+    def __init__(self):
+        global options
+        Translator.__init__(self)
+        #reverse translation from m5 params to power params
+        #params
+        self.addPowerParam(power_key="clock_rate", m5_key="clockrate")
+        self.addPowerParam(power_key="opt_local", m5_key="unknown", default_value='1')
+        self.addPowerParam(power_key="instruction_length", m5_key="unknown", default_value="32") #TODO: set your value
+        self.addPowerParam(power_key="opcode_width", m5_key="unknown", default_value="7") #TODO: set your value
+        self.addPowerParam(power_key="x86", m5_key="unknown", default_value="0") #TODO: set your value
+        self.addPowerParam(power_key="micro_opcode_width", m5_key="unknown", default_value="8") #TODO: set your value
+        self.addPowerParam(power_key="machine_type", m5_key="unknown", default_value="0") #TODO: set your value
+        self.addPowerParam(power_key="number_hardware_threads", m5_key="numThreads", default_value="1")
+        self.addPowerParam(power_key="fetch_width", m5_key="fetchWidth", default_value="4")
+        self.addPowerParam(power_key="number_instruction_fetch_ports", m5_key="unknown", default_value="1") #TODO: set your value
+        self.addPowerParam(power_key="decode_width", m5_key="decodeWidth", default_value="4")
+        self.addPowerParam(power_key="issue_width", m5_key="issueWidth", default_value="4")
+        self.addPowerParam(power_key="peak_issue_width", m5_key="issueWidth", default_value="6") #TODO: set your value
+        self.addPowerParam(power_key="commit_width", m5_key="commitWidth", default_value="4")
+        self.addPowerParam(power_key="fp_issue_width", m5_key="fp_issue_width", default_value="4") #TODO: set your value
+        self.addPowerParam(power_key="prediction_width", m5_key="unknown", default_value="1") #TODO: set your value
+        self.addPowerParam(power_key="pipelines_per_core", m5_key="unknown", default_value="1,1") #TODO: set your value
+        self.addPowerParam(power_key="pipeline_depth", m5_key="unknown", default_value="7,7") #TODO: set your value
+        if options.qualcomm:
+            self.addPowerParam(power_key="ALU_per_core", m5_key="ALU_per_core", default_value="2") #TODO: set your value
+        else:
+            self.addPowerParam(power_key="ALU_per_core", m5_key="ALU_per_core", default_value="4") #TODO: set your value
+        self.addPowerParam(power_key="MUL_per_core", m5_key="MUL_per_core", default_value="2") #TODO: set your value
+        self.addPowerParam(power_key="FPU_per_core", m5_key="FPU_per_core", default_value="2") #TODO: set your value
+        self.addPowerParam(power_key="instruction_buffer_size", m5_key="instruction_buffer_size", default_value="32") #TODO: set your value
+        self.addPowerParam(power_key="decoded_stream_buffer_size", m5_key="decoded_stream_buffer_size", default_value="16") #TODO: set your value
+        self.addPowerParam(power_key="instruction_window_scheme", m5_key="unknown", default_value="0") #TODO: set your value
+        self.addPowerParam(power_key="instruction_window_size", m5_key="numIQEntries", default_value="20")
+        self.addPowerParam(power_key="fp_instruction_window_size", m5_key="numIQEntries", default_value="15")
+        self.addPowerParam(power_key="ROB_size", m5_key="numROBEntries", default_value="80")
+        self.addPowerParam(power_key="archi_Regs_IRF_size", m5_key="unknown", default_value="32") #TODO: set your value
+        self.addPowerParam(power_key="archi_Regs_FRF_size", m5_key="unknown", default_value="32") #TODO: set your value
+        self.addPowerParam(power_key="phy_Regs_IRF_size", m5_key="numPhysIntRegs", default_value="80")
+        self.addPowerParam(power_key="phy_Regs_FRF_size", m5_key="numPhysFloatRegs", default_value="72")
+        self.addPowerParam(power_key="rename_scheme", m5_key="unknown", default_value="1") #TODO: set your value
+        self.addPowerParam(power_key="register_windows_size", m5_key="unknown", default_value="0") #TODO: set your value
+        self.addPowerParam(power_key="LSU_order", m5_key="unknown", default_value="inorder") #TODO: set your value
+        self.addPowerParam(power_key="store_buffer_size", m5_key="SQEntries", default_value="32")
+        self.addPowerParam(power_key="load_buffer_size", m5_key="LQEntries", default_value="32")
+        self.addPowerParam(power_key="memory_ports", m5_key="memory_ports", default_value="2") #TODO: set your value
+        self.addPowerParam(power_key="RAS_size", m5_key="RASSize", default_value="32")
+
+        #statistics
+        self.addPowerStat(power_key="total_instructions", m5_key="committedInsts", default_value="0")
+        self.addPowerStat(power_key="int_instructions", m5_key="int_instructions", default_value="NaV")
+        self.addPowerStat(power_key="fp_instructions", m5_key="fp_instructions", default_value="NaV")
+        self.addPowerStat(power_key="branch_instructions", m5_key="BPredUnit.condPredicted", default_value="NaV")
+        self.addPowerStat(power_key="branch_mispredictions", m5_key="BPredUnit.condIncorrect", default_value="NaV")
+        self.addPowerStat(power_key="load_instructions", m5_key="load_instructions", default_value="NaV")
+        self.addPowerStat(power_key="store_instructions", m5_key="store_instructions", default_value="NaV")
+        self.addPowerStat(power_key="committed_instructions", m5_key="commit.count", default_value="NaV")
+        self.addPowerStat(power_key="committed_int_instructions", m5_key="commit.int_insts", default_value="NaV")
+        self.addPowerStat(power_key="committed_fp_instructions", m5_key="commit.fp_insts", default_value="NaV")
+        self.addPowerStat(power_key="pipeline_duty_cycle", m5_key="unknown", default_value="1") #TODO: set your value
+        self.addPowerStat(power_key="total_cycles", m5_key="numCycles", default_value="NaV")
+        self.addPowerStat(power_key="idle_cycles", m5_key="idleCycles", default_value="NaV")
+        self.addPowerStat(power_key="busy_cycles", m5_key="num_busy_cycles", default_value="NaV")
+        self.addPowerStat(power_key="ROB_reads", m5_key="rob_reads", default_value="34794891") #FIXME: rerun the experiments to include this statistic
+        self.addPowerStat(power_key="ROB_writes", m5_key="rob_writes", default_value="34794891") #FIXME: rerun the experiments to include this statistic
+        self.addPowerStat(power_key="rename_reads", m5_key="rename.int_rename_lookups", default_value="0")
+        self.addPowerStat(power_key="rename_writes", m5_key="unknown", default_value="0") #TODO: FIXME
+        self.addPowerStat(power_key="fp_rename_reads", m5_key="rename.fp_rename_lookups", default_value="0")
+        self.addPowerStat(power_key="fp_rename_writes", m5_key="unknown", default_value="0") #TODO: FIXME
+        self.addPowerStat(power_key="inst_window_reads", m5_key="iq.int_inst_queue_reads", default_value="NaV")
+        self.addPowerStat(power_key="inst_window_writes", m5_key="iq.int_inst_queue_writes", default_value="NaV")
+        self.addPowerStat(power_key="inst_window_wakeup_accesses", m5_key="iq.int_inst_queue_wakeup_accesses", default_value="NaV")
+        self.addPowerStat(power_key="fp_inst_window_reads", m5_key="iq.fp_inst_queue_reads", default_value="0")
+        self.addPowerStat(power_key="fp_inst_window_writes", m5_key="iq.fp_inst_queue_writes", default_value="NaV")
+        self.addPowerStat(power_key="fp_inst_window_wakeup_accesses", m5_key="iq.fp_inst_queue_wakeup_accesses", default_value="NaV")
+        self.addPowerStat(power_key="int_regfile_reads", m5_key="int_regfile_reads", default_value="0")
+        self.addPowerStat(power_key="float_regfile_reads", m5_key="fp_regfile_reads", default_value="0")
+        self.addPowerStat(power_key="int_regfile_writes", m5_key="int_regfile_writes", default_value="0")
+        self.addPowerStat(power_key="float_regfile_writes", m5_key="fp_regfile_writes", default_value="0")
+        self.addPowerStat(power_key="function_calls", m5_key="commit.function_calls", default_value="NaV")
+        self.addPowerStat(power_key="context_switches", m5_key="kern.swap_context", default_value="0")
+        self.addPowerStat(power_key="ialu_accesses", m5_key="iq.int_alu_accesses", default_value="NaV")
+        self.addPowerStat(power_key="fpu_accesses", m5_key="iq.fp_alu_accesses", default_value="NaV")
+        self.addPowerStat(power_key="mul_accesses", m5_key="iq.FU_type_0::IntMult", default_value="NaV")
+        self.addPowerStat(power_key="cdb_alu_accesses", m5_key="iq.int_alu_accesses", default_value="NaV")
+        self.addPowerStat(power_key="cdb_mul_accesses", m5_key="iq.FU_type_0::IntMult", default_value="NaV")
+        self.addPowerStat(power_key="cdb_fpu_accesses", m5_key="iq.fp_alu_accesses", default_value="NaV")
+        #DO NOT CHANGE BELOW UNLESS YOU KNOW WHAT YOU ARE DOING
+        self.addPowerStat(power_key="IFU_duty_cycle", m5_key="unknown", default_value="1")
+        self.addPowerStat(power_key="LSU_duty_cycle", m5_key="unknown", default_value="1")
+        self.addPowerStat(power_key="MemManU_I_duty_cycle", m5_key="unknown", default_value="1")
+        self.addPowerStat(power_key="MemManU_D_duty_cycle", m5_key="unknown", default_value="1")
+        self.addPowerStat(power_key="ALU_duty_cycle", m5_key="unknown", default_value="1")
+        self.addPowerStat(power_key="MUL_duty_cycle", m5_key="unknown", default_value="0.3")
+        self.addPowerStat(power_key="FPU_duty_cycle", m5_key="unknown", default_value="1")
+        self.addPowerStat(power_key="ALU_cdb_duty_cycle", m5_key="unknown", default_value="1")
+        self.addPowerStat(power_key="MUL_cdb_duty_cycle", m5_key="unknown", default_value="0.3")
+        self.addPowerStat(power_key="FPU_cdb_duty_cycle", m5_key="unknown", default_value="1")
+        self.addPowerStat(power_key="number_of_BPT", m5_key="unknown", default_value="2")
+
+class AlphaTLB(Translator):
+    def __init__(self):
+        Translator.__init__(self)
+        #params
+        self.addPowerParam(power_key="number_entries", m5_key="size")
+        #statistics
+        self.addPowerStat(power_key="fetch_accesses", m5_key="fetch_accesses", default_value="0")
+        self.addPowerStat(power_key="fetch_misses", m5_key="fetch_misses", default_value="0")
+        self.addPowerStat(power_key="data_accesses", m5_key="data_accesses", default_value="0")
+        self.addPowerStat(power_key="data_misses", m5_key="data_misses", default_value="0")
+
+class ITLB(Translator):
+    def __init__(self):
+        Translator.__init__(self)
+        #params
+        self.addPowerParam(power_key="number_entries", m5_key="size")
+        #statistics
+        self.addPowerStat(power_key="total_accesses", m5_key="total_accesses", default_value="0")
+        self.addPowerStat(power_key="total_misses", m5_key="fetch_misses", default_value="0")
+        self.addPowerStat(power_key="conflicts", m5_key="unknown", default_value="0") #FIXME: add this stat to M5. Sheng says it is the number of evictions. This is a question for the M5 community.
+
+class DTLB(Translator):
+    def __init__(self):
+        Translator.__init__(self)
+        #params
+        self.addPowerParam(power_key="number_entries", m5_key="size")
+        #statistics
+        self.addPowerStat(power_key="read_accesses", m5_key="read_accesses", default_value="0")
+        self.addPowerStat(power_key="write_accesses", m5_key="write_accesses", default_value="0")
+        self.addPowerStat(power_key="read_misses", m5_key="read_misses", default_value="0")
+        self.addPowerStat(power_key="write_misses", m5_key="write_misses", default_value="0")
+        self.addPowerStat(power_key="conflicts", m5_key="unknown", default_value="0") #FIXME: add this stat to M5. Sheng says it is the number of evictions. This is a question for the M5 community
+
+class InstructionCache(Translator):
+    def __init__(self):
+        Translator.__init__(self)
+        #params
+        self.addPowerParam(power_key="icache_config", m5_key="icache_config")
+        self.addPowerParam(power_key="buffer_sizes", m5_key="buffer_sizes")
+        #statistics
+        self.addPowerStat(power_key="read_accesses", m5_key="ReadReq_accesses", default_value="0")
+        self.addPowerStat(power_key="read_misses", m5_key="ReadReq_misses", default_value="0")
+        self.addPowerStat(power_key="conflicts", m5_key="replacements", default_value="0")
+
+class DataCache(Translator):
+    def __init__(self):
+        Translator.__init__(self)
+        #params
+        self.addPowerParam(power_key="dcache_config", m5_key="dcache_config")
+        self.addPowerParam(power_key="buffer_sizes", m5_key="buffer_sizes")
+        #statistics
+        self.addPowerStat(power_key="read_accesses", m5_key="ReadReq_accesses", default_value="0")
+        if options.old_m5_stats:
+            self.addPowerStat(power_key="write_accesses", m5_key="ReadExReq_accesses", default_value="0")
+        else:
+            self.addPowerStat(power_key="write_accesses", m5_key="WriteReq_accesses", default_value="0")
+        self.addPowerStat(power_key="read_misses", m5_key="ReadReq_misses", default_value="0")
+        if options.old_m5_stats:
+            self.addPowerStat(power_key="write_misses", m5_key="ReadExReq_misses", default_value="0")
+        else:
+            self.addPowerStat(power_key="write_misses", m5_key="WriteReq_misses", default_value="0")
+        self.addPowerStat(power_key="conflicts", m5_key="replacements", default_value="0")
+
+class SharedCacheL2(Translator):
+    def __init__(self):
+        global options
+        Translator.__init__(self)
+        #params
+        self.addPowerParam(power_key="L2_config", m5_key="L2_config")
+        self.addPowerParam(power_key="buffer_sizes", m5_key="buffer_sizes")
+        self.addPowerParam(power_key="clockrate", m5_key="clockrate", default_value="NaV")
+        self.addPowerParam(power_key="ports", m5_key="unknown", default_value="1,1,1") #TODO: specify your value
+        self.addPowerParam(power_key="device_type", m5_key="unknown", default_value=options.cache_device_type) #TODO: specify your value
+        ##statistics
+        self.addPowerStat(power_key="read_accesses", m5_key="ReadReq_accesses", default_value="0")
+        self.addPowerStat(power_key="write_accesses", m5_key="ReadExReq_accesses", default_value="0")
+        self.addPowerStat(power_key="read_misses", m5_key="ReadReq_misses", default_value="0")
+        self.addPowerStat(power_key="write_misses", m5_key="ReadExReq_misses", default_value="0")
+        self.addPowerStat(power_key="conflicts", m5_key="replacements", default_value="0")
+        self.addPowerStat(power_key="duty_cycle", m5_key="unknown", default_value="1.0")
+
+class SharedCacheL3(Translator):
+    def __init__(self):
+        Translator.__init__(self)
+        #params
+        self.addPowerParam(power_key="L3_config", m5_key="L3_config")
+        self.addPowerParam(power_key="buffer_sizes", m5_key="buffer_sizes")
+        self.addPowerParam(power_key="clockrate", m5_key="clockrate", default_value="NaV")
+        self.addPowerParam(power_key="ports", m5_key="unknown", default_value="1,1,1") #TODO: specify your value
+        self.addPowerParam(power_key="device_type", m5_key="unknown", default_value=options.cache_device_type) #TODO: specify your value
+        ##statistics
+        self.addPowerStat(power_key="read_accesses", m5_key="ReadReq_accesses", default_value="0")
+        self.addPowerStat(power_key="write_accesses", m5_key="ReadExReq_accesses", default_value="0")
+        self.addPowerStat(power_key="read_misses", m5_key="ReadReq_misses", default_value="0")
+        self.addPowerStat(power_key="write_misses", m5_key="ReadExReq_misses", default_value="0")
+        self.addPowerStat(power_key="conflicts", m5_key="replacements", default_value="0")
+
+class Mesh(Translator):
+    def __init__(self):
+        Translator.__init__(self)
+        #params
+        self.addPowerParam(power_key="clockrate", m5_key="clockrate", default_value="1400")
+        self.addPowerParam(power_key="horizontal_nodes", m5_key="horizontal_nodes", default_value="2")
+        self.addPowerParam(power_key="vertical_nodes", m5_key="vertical_nodes", default_value="1")
+        self.addPowerParam(power_key="has_global_link", m5_key="has_global_link", default_value="0")
+        self.addPowerParam(power_key="link_throughput", m5_key="link_throughput", default_value="1")
+        self.addPowerParam(power_key="link_latency", m5_key="link_latency", default_value="1")
+        self.addPowerParam(power_key="input_ports", m5_key="input_ports", default_value="9")
+        self.addPowerParam(power_key="output_ports", m5_key="output_ports", default_value="8")
+        self.addPowerParam(power_key="virtual_channel_per_port", m5_key="unknown", default_value="1") #FIXME: what is this?
+        self.addPowerParam(power_key="flit_bits", m5_key="unknown", default_value="136") #FIXME: what is this?
+        self.addPowerParam(power_key="input_buffer_entries_per_vc", m5_key="unknown", default_value="16")#FIXME
+        self.addPowerParam(power_key="chip_coverage", m5_key="unknown", default_value="1")
+
+        #statistics
+        self.addPowerStat(power_key="total_accesses", m5_key="total_packets_received", default_value="0")
+        self.addPowerStat(power_key="duty_cycle", m5_key="unknown", default_value="0.1")
+
+
+class BusConn(Translator):
+    def __init__(self):
+        Translator.__init__(self)
+        #params
+        self.addPowerParam(power_key="clockrate", m5_key="clockrate", default_value="1400")
+        self.addPowerParam(power_key="type", m5_key="unknown", default_value="0")
+        self.addPowerParam(power_key="vertical_nodes", m5_key="unknown", default_value="1")
+        self.addPowerParam(power_key="has_global_link", m5_key="unknown", default_value="1")
+        self.addPowerParam(power_key="link_throughput", m5_key="unknown", default_value="1")
+        self.addPowerParam(power_key="link_latency", m5_key="unknown", default_value="1")
+        self.addPowerParam(power_key="input_ports", m5_key="input_ports", default_value="9")
+        self.addPowerParam(power_key="output_ports", m5_key="output_ports", default_value="8")
+        self.addPowerParam(power_key="virtual_channel_per_port", m5_key="unknown", default_value="2") #FIXME: what is this?
+        self.addPowerParam(power_key="flit_bits", m5_key="unknown", default_value="40") #FIXME: what is this?
+        self.addPowerParam(power_key="input_buffer_entries_per_vc", m5_key="unknown", default_value="128")#FIXME
+        self.addPowerParam(power_key="chip_coverage", m5_key="unknown", default_value="1")
+        self.addPowerParam(power_key="link_routing_over_percentage", m5_key="unknown", default_value="1.0")
+
+        #statistics
+        self.addPowerStat(power_key="total_accesses", m5_key="total_packets_received", default_value="0")
+        self.addPowerStat(power_key="duty_cycle", m5_key="unknown", default_value="1")
+
+class Bus(Translator):
+    def __init__(self):
+        Translator.__init__(self)
+        #params
+        self.addPowerParam(power_key="clockrate", m5_key="clockrate", default_value="0")
+        self.addPowerParam(power_key="type", m5_key="unknown", default_value="0") # 0 for BUS
+        self.addPowerParam(power_key="horizontal_nodes", m5_key="unknown", default_value="1")
+        self.addPowerParam(power_key="vertical_nodes", m5_key="unknown", default_value="1")
+        self.addPowerParam(power_key="has_global_link", m5_key="unknown", default_value="1")
+        self.addPowerParam(power_key="link_throughput", m5_key="unknown", default_value="1")
+        self.addPowerParam(power_key="link_latency", m5_key="unknown", default_value="1")
+        self.addPowerParam(power_key="input_ports", m5_key="input_ports", default_value="0")
+        self.addPowerParam(power_key="output_ports", m5_key="output_ports", default_value="0")
+        self.addPowerParam(power_key="virtual_channel_per_port", m5_key="unknown", default_value="2") #FIXME: what is this?
+        self.addPowerParam(power_key="input_buffer_entries_per_vc", m5_key="unknown", default_value="128")#FIXME
+        self.addPowerParam(power_key="flit_bits", m5_key="unknown", default_value="40") #FIXME: what is this?
+
+        self.addPowerParam(power_key="chip_coverage", m5_key="unknown", default_value="1") #really should be a function of the number of nocs
+        self.addPowerParam(power_key="link_routing_over_percentage", m5_key="unknown", default_value="0.5")
+
+        #statistics
+        self.addPowerStat(power_key="total_accesses", m5_key="total_packets_received", default_value="0")
+        self.addPowerStat(power_key="duty_cycle", m5_key="unknown", default_value="1")
+
+class Crossbar(Translator):
+    def __init__(self):
+        Translator.__init__(self)
+        #params
+        self.addPowerParam(power_key="clock", m5_key="clock")
+        self.addPowerParam(power_key="port", m5_key="port")
+        self.addPowerParam(power_key="type", m5_key="type")
+        self.addPowerParam(power_key="bandwidth", m5_key="bandwidth_Mbps")
+        #statistics
+        self.addPowerStat(power_key="accesses", m5_key="accesses")
+
+class Predictor(Translator):
+    def __init__(self):
+        Translator.__init__(self)
+        #params
+        self.addPowerParam(power_key="local_predictor_size", m5_key="unknown", default_value="10,3")
+        self.addPowerParam(power_key="local_predictor_entries", m5_key="unkown", default_value="1024")
+        self.addPowerParam(power_key="global_predictor_entries", m5_key="unknown", default_value="4096")
+        self.addPowerParam(power_key="global_predictor_bits", m5_key="unknown", default_value="2")
+        self.addPowerParam(power_key="chooser_predictor_entries", m5_key="unknown", default_value="4096")
+        self.addPowerParam(power_key="chooser_predictor_bits", m5_key="unknown", default_value="2")
+        #self.addPowerParam(power_key="prediction_width", m5_key="unknown", default_value="2")
+        #statistics
+
+class System(Translator):
+
+    Translator.registerComponentClass("system", SystemComponent)
+
+    def __init__(self):
+        Translator.__init__(self)
+        global options
+        #params
+        self.addPowerParam(power_key="number_of_cores", m5_key="number_of_cores", default_value="NaV")
+        self.addPowerParam(power_key="number_of_L1Directories", m5_key="number_of_L2s", default_value="NaV")
+        self.addPowerParam(power_key="number_of_L2Directories", m5_key="number_of_L2Directories", default_value="NaV") #Shadow L4 with 0 latency back memory is our L2 directory
+        self.addPowerParam(power_key="number_of_L2s", m5_key="number_of_L2s", default_value="NaV")
+        self.addPowerParam(power_key="number_of_L3s", m5_key="number_of_L3s", default_value="NaV")
+        self.addPowerParam(power_key="number_of_NoCs", m5_key="number_of_nocs", default_value="NaV")
+        self.addPowerParam(power_key="homogeneous_cores", m5_key="homogeneous_cores", default_value="0")
+        self.addPowerParam(power_key="homogeneous_L2s", m5_key="homogeneous_L2s", default_value="0") #TODO: set your value
+        self.addPowerParam(power_key="homogeneous_L1Directories", m5_key="homogeneous_L1Directories", default_value="0") #TODO: set your value
+        self.addPowerParam(power_key="homogeneous_L2Directories", m5_key="homogeneous_L2Directories", default_value="1") #TODO: set your value
+        self.addPowerParam(power_key="homogeneous_L3s", m5_key="homogeneous_L3s", default_value="1") #TODO: set your value
+        self.addPowerParam(power_key="homogeneous_ccs", m5_key="unknown", default_value="1") #TODO: set your value
+        self.addPowerParam(power_key="homogeneous_NoCs", m5_key="homogeneous_nocs", default_value="0") #TODO: set your value
+        self.addPowerParam(power_key="core_tech_node", m5_key="unknown", default_value=options.core_tech_node) #TODO: set your value
+        if options.sys_vdd_scale != None:
+            self.addPowerParam(power_key="sys_vdd_scale", m5_key="unknown", default_value=options.sys_vdd_scale) #TODO: set your value
+        self.addPowerParam(power_key="target_core_clockrate", m5_key="unknown", default_value="2000") #TODO: set your value
+        self.addPowerParam(power_key="temperature", m5_key="unknown", default_value="350") #TODO: set your value
+        self.addPowerParam(power_key="number_cache_levels", m5_key="number_cache_levels", default_value="NaV")
+        self.addPowerParam(power_key="interconnect_projection_type", m5_key="unknown", default_value=options.interconnect_projection_type) #TODO: set your value
+        self.addPowerParam(power_key="device_type", m5_key="unknown", default_value=options.core_device_type) #TODO: set your value
+        self.addPowerParam(power_key="longer_channel_device", m5_key="unknown", default_value="0") #TODO: set your value
+        self.addPowerParam(power_key="machine_bits", m5_key="unknown", default_value="64") #TODO: set your value
+        self.addPowerParam(power_key="virtual_address_width", m5_key="unknown", default_value="64") #TODO: set your value
+        self.addPowerParam(power_key="physical_address_width", m5_key="unknown", default_value="52") #TODO: set your value
+        self.addPowerParam(power_key="virtual_memory_page_size", m5_key="unknown", default_value="4096") #TODO: set your value
+        self.addPowerParam(power_key="number_of_dir_levels", m5_key="number_of_dir_levels", default_value="0") #TODO: set your value
+        #self.addPowerParam(power_key="first_level_dir", m5_key="first_level_dir", default_value="NaV") #REMOVED: ask Sheng what this stat is all about
+        #self.addPowerParam(power_key="domain_size", m5_key="unknown", default_value="NaV") #REMOVED: ask Sheng about domain size
+
+
+        self.addPowerStat(power_key="total_cycles", m5_key="total_cycles", default_value="0") #FIXME: ask Sheng about domain size
+        self.addPowerStat(power_key="idle_cycles", m5_key="unknown", default_value="0") #FIXME: ask Sheng about domain size
+        self.addPowerStat(power_key="busy_cycles", m5_key="total_cycles", default_value="0") #FIXME: ask Sheng about domain size
+
+class BTB(Translator):
+    def __init__(self):
+        Translator.__init__(self)
+        #params
+        self.addPowerParam(power_key="BTB_config", m5_key="unknown", default_value="6144,4,2,1,1,3")
+        #statistics
+        self.addPowerParam(power_key="read_accesses", m5_key="BPredUnit.BTBLookup", default_value="0")
+        self.addPowerParam(power_key="write_accesses", m5_key="unknown", default_value="0")
+
+class L1Directory(Translator):
+    def __init__(self):
+        Translator.__init__(self)
+        #params
+        self.addPowerParam(power_key="Directory_type", m5_key="unknown", default_value="1") #TODO: specify your value
+        self.addPowerParam(power_key="Dir_config", m5_key="Dir_config", default_value="NaV")
+        self.addPowerParam(power_key="buffer_sizes", m5_key="unknown", default_value="8,8,8,8") #TODO: specify your value
+        self.addPowerParam(power_key="clockrate", m5_key="clockrate", default_value="NaV")
+        self.addPowerParam(power_key="ports", m5_key="unknown", default_value="1,1,1") #TODO: specify your value
+        self.addPowerParam(power_key="device_type", m5_key="unknown", default_value=options.cache_device_type) #TODO: specify your value
+        #statistics
+        self.addPowerStat(power_key="read_accesses", m5_key="read_accesses", default_value="NaV")
+        self.addPowerStat(power_key="write_accesses", m5_key="write_accesses", default_value="NaV")
+        self.addPowerStat(power_key="read_misses", m5_key="unknown", default_value="0") #FIXME: Add this stat to M5. My model does not treat directory as a cache
+        self.addPowerStat(power_key="write_misses", m5_key="unknown", default_value="0") #FIXME: Add this stat to M5. My model does not treat directory as a cache
+        self.addPowerStat(power_key="conflicts", m5_key="unknown", default_value="0") #FIXME: Add this stat to M5. My model does not treat directory as a cache
+
+
+class L2Directory(Translator):
+    def __init__(self):
+        Translator.__init__(self)
+        #params
+        self.addPowerParam(power_key="Directory_type", m5_key="unknown", default_value="1") #TODO: specify your value
+        self.addPowerParam(power_key="Dir_config", m5_key="Dir_config", default_value="NaV")
+        self.addPowerParam(power_key="buffer_sizes", m5_key="unknown", default_value="8,8,8,8") #TODO: specify your value
+        self.addPowerParam(power_key="clockrate", m5_key="clockrate", default_value="NaV")
+        self.addPowerParam(power_key="ports", m5_key="unknown", default_value="1,1,1") #TODO: specify your value
+        self.addPowerParam(power_key="device_type", m5_key="unknown", default_value=options.cache_device_type) #TODO: specify your value
+        #statistics
+        self.addPowerStat(power_key="read_accesses", m5_key="read_accesses", default_value="NaV")
+        self.addPowerStat(power_key="write_accesses", m5_key="write_accesses", default_value="NaV")
+        self.addPowerStat(power_key="read_misses", m5_key="unknown", default_value="0") #FIXME: Add this stat to M5. My model does not treat directory as a cache
+        self.addPowerStat(power_key="write_misses", m5_key="unknown", default_value="0") #FIXME: Add this stat to M5. My model does not treat directory as a cache
+        self.addPowerStat(power_key="conflicts", m5_key="unknown", default_value="0") #FIXME: Add this stat to M5. My model does not treat directory as a cache
+
+class PhysicalMemory(Translator):
+    def __init__(self):
+        Translator.__init__(self)
+        global options
+
+        self.addPowerParam(power_key="mem_tech_node", m5_key="unknown", default_value=options.mem_tech_node) #TODO: Set your value
+
+        self.addPowerParam(power_key="device_clock", m5_key="unknown", default_value="200") #TODO: Set your value
+        self.addPowerParam(power_key="peak_transfer_rate", m5_key="unknown", default_value="6400") #TODO: set your value
+        self.addPowerParam(power_key="internal_prefetch_of_DRAM_chip", m5_key="unknown", default_value="4") #FIXME: add this param to M5
+        self.addPowerParam(power_key="capacity_per_channel", m5_key="unknown", default_value="4096") #TODO: set your value
+        self.addPowerParam(power_key="number_ranks", m5_key="unknown", default_value="2") #TODO: set your value
+        self.addPowerParam(power_key="num_banks_of_DRAM_chip", m5_key="unknown", default_value="8") #TODO: set your value
+        self.addPowerParam(power_key="Block_width_of_DRAM_chip", m5_key="unknown", default_value="64") #TODO: set your value
+        self.addPowerParam(power_key="output_width_of_DRAM_chip", m5_key="unknown", default_value="8") #TODO: set your value
+        self.addPowerParam(power_key="page_size_of_DRAM_chip", m5_key="unknown", default_value="8") #TODO: set your value
+        self.addPowerParam(power_key="burstlength_of_DRAM_chip", m5_key="unknown", default_value="8") #TODO: set your value
+        #statistcs
+        self.addPowerStat(power_key="memory_accesses", m5_key="num_phys_mem_accesses", default_value="0")
+        self.addPowerStat(power_key="memory_reads", m5_key="num_phys_mem_reads", default_value="0")
+        self.addPowerStat(power_key="memory_writes", m5_key="num_phys_mem_writes", default_value="0")
+
+#Memory Controller
+class MC(Translator):
+    def __init__(self):
+        Translator.__init__(self)
+        self.addPowerParam(power_key="mc_clock", m5_key="unknown", default_value="800") #TODO: set your value
+        self.addPowerParam(power_key="peak_transfer_rate", m5_key="1600", default_value="1600") #TODO: set your value
+        self.addPowerParam(power_key="llc_line_length", m5_key="unknown", default_value="16") #TODO: set your value
+        self.addPowerParam(power_key="number_mcs", m5_key="unknown", default_value="1") #TODO: set this value
+        self.addPowerParam(power_key="memory_channels_per_mc", m5_key="unknown", default_value="2") #TODO: set your value
+        self.addPowerParam(power_key="number_ranks", m5_key="unknown", default_value="2") #TODO: set your value
+        self.addPowerParam(power_key="req_window_size_per_channel", m5_key="unknown", default_value="32") #TODO: set your value
+        self.addPowerParam(power_key="IO_buffer_size_per_channel", m5_key="unknown", default_value="32") #TODO: set your value
+        self.addPowerParam(power_key="databus_width", m5_key="unknown", default_value="32") #TODO: set your value
+        self.addPowerParam(power_key="addressbus_width", m5_key="unknown", default_value="32") #TODO: set your value
+        #statistcs
+        self.addPowerStat(power_key="memory_accesses", m5_key="num_phys_mem_accesses", default_value="0")
+        self.addPowerStat(power_key="memory_reads", m5_key="num_phys_mem_reads", default_value="0")
+        self.addPowerStat(power_key="memory_writes", m5_key="num_phys_mem_writes", default_value="0")
+
+
+# Network Interface Controller
+class NIC(Translator):
+    def __init__(self):
+        Translator.__init__(self)
+        self.addPowerParam(power_key="type", m5_key="unknown", default_value="1") #TODO: set your value
+        self.addPowerParam(power_key="clockrate", m5_key="unknown", default_value="15") #TODO: set your value
+        self.addPowerParam(power_key="number_units", m5_key="unknown", default_value="0") #TODO: set your value
+        #statistics
+        self.addPowerStat(power_key="duty_cycle", m5_key="unknown", default_value="1.0") #TODO: set your value
+        self.addPowerStat(power_key="total_load_perc", m5_key="unknown", default_value="0.0") #TODO: set your value
+
+# PCI Express Controller
+class PCIE(Translator):
+    def __init__(self):
+        Translator.__init__(self)
+        self.addPowerParam(power_key="type", m5_key="unknown", default_value="1") #TODO: set your value
+        self.addPowerParam(power_key="withPHY", m5_key="unknown", default_value="1") #TODO: set your value
+        self.addPowerParam(power_key="clockrate", m5_key="unknown", default_value="350") #TODO: set your value
+        self.addPowerParam(power_key="number_units", m5_key="unknown", default_value="0") #TODO: set your value
+        self.addPowerParam(power_key="num_channels", m5_key="unknown", default_value="2") #TODO: set your value
+        #statistic
+        self.addPowerStat(power_key="duty_cycle", m5_key="unknown", default_value="1.0") #TODO: set your value
+        self.addPowerStat(power_key="total_load_perc", m5_key="unknown", default_value="0.0") #TODO: set your value
+
+
+# Flash Controller
+class Flash(Translator):
+    def __init__(self):
+        Translator.__init__(self)
+        self.addPowerParam(power_key="number_flashcs", m5_key="unknown", default_value="0") #TODO: set your value
+        self.addPowerParam(power_key="type", m5_key="unknown", default_value="1") #TODO: set your value
+        self.addPowerParam(power_key="withPHY", m5_key="unknown", default_value="1") #TODO: set your value
+        self.addPowerParam(power_key="peak_transfer_rate", m5_key="unknown", default_value="200") #TODO: set your value
+        #statistics
+        self.addPowerStat(power_key="duty_cycle", m5_key="unknown", default_value="1.0") #TODO: set your value
+        self.addPowerStat(power_key="total_load_perc", m5_key="unknown", default_value="0.0") #TODO: set your value
+
+
+'''
+setComponentType takes as input a component object, and assigns
+the translator field to the right type of Translator object. Translator
+objects are responsible for grabbing the right stats and naming them
+correctly
+'''
+def setComponentType(component):
+    global options
+
+    for pair in options.interconn_names.split('#'):
+        name, util = pair.split(',')
+        if name in component.name:
+            if component.params['type'] == "Bus":
+                component.translator = Bus()
+            elif component.params['type'] == "BusConn":
+                component.translator = BusConn()
+            elif component.params['type'] == "Mesh2D":
+                component.translator = Mesh()
+            elif component.params['type'] == "Crossbar":
+                component.translator = Crossbar()
+            return
+    if options.cpu_name in component.name:
+        if component.params['type'] == "TimingSimpleCPU":
+            component.translator = InOrderCore()
+        if component.params['type'] == "DerivO3CPU":
+            component.translator = OOOCore()
+    elif options.itb_name in component.name:
+        component.translator = ITLB()
+    elif options.dtb_name in component.name:
+        component.translator = DTLB()
+    elif "icache" in component.name:
+        if component.params['type'] == "BaseCache":
+            component.translator = InstructionCache()
+    elif "dcache" in component.name:
+        if component.params['type'] == "BaseCache":
+            component.translator = DataCache()
+    elif "Directory" in component.name:
+        if "L1" in component.name:
+            component.translator = L1Directory()
+        elif "L2" in component.name:
+            component.translator = L2Directory()
+    elif "l2" in component.name:
+        if component.params['type'] == "BaseCache":
+            component.translator = SharedCacheL2()
+    elif "l3" in component.name:
+        if component.params['type'] == "BaseCache":
+            component.translator = SharedCacheL3()
+    elif "physmem" in component.name:
+        component.translator = PhysicalMemory()
+    elif options.system_name == component.name:
+        component.translator = System()
+    elif "PBT" in component.name:
+        component.translator = Predictor()
+    elif "BTB" in component.name:
+        component.translator = BTB()
+    elif "mc" in component.name:
+        component.translator = MC()
+    elif "niu" in component.name:
+        component.translator = NIC()
+    elif "pcie" in component.name:
+        component.translator = PCIE()
+    elif "flash" in component.name:
+        component.translator = Flash()
+    else:
+        return
+
+'''
+find the voltage scaling for a frequency scaling for data:
+from Gaurav Dhiman's Hotpower paper
+DFS	        FREQ	VOLT	PERC_VOLT
+1	        2600	1.25	1
+0.730769231	1900	1.15	0.92
+0.538461538	1400	1.05	0.84
+0.307692308	800	    0.9	    0.72
+dvs = 0.4032*dfs + 0.6102
+'''
+def dfsToDvs(dfs):
+    dvs = 0.4032*dfs + 0.6102
+    return dvs
+
+
+'''
+run() is repsonsible for going through all the directories
+that have results, creating paths to all important files,
+and calling parseSystemConfig that handles the power.xml
+creation.
+'''
+def run():
+    global options
+    filter = ""
+    if options.process_run_dirs_by_filter != None:
+        dirs = os.listdir('.')
+        filter = options.process_run_dirs_by_filter
+    else:
+        dirs = '.'
+
+    for dir in dirs:
+        if filter not in dir:
+            continue
+
+        if options.do_vdd_scaling and "1core:dfs" in dir:
+            match = re.match("run.*:1core:dfs([0-9]+)",dir)
+            assert(match)
+            dfs = int(match.group(1))/100.0
+            dvs = dfsToDvs(dfs)
+            options.sys_vdd_scale = str(dvs)
+        else:
+            options.sys_vdd_scale = None
+        component_hash = {}
+        stats_hash = {}
+        if options.verbose:
+            print "processing:%s" %(dir)
+        if options.m5dir:
+            if os.path.exists(options.m5dir):
+                output_dir=options.m5dir
+            else:
+               panic("m5 output directory '%s' does not exist!" % options.m5dir)
+        else:
+            output_dir="m5out"
+        if not os.path.exists(os.path.join(dir,output_dir)):
+          output_dir=""
+
+        config_file_path = os.path.join(dir, output_dir,options.config_fn)
+
+        if options.stats_fn == '/dev/stdin':
+            stat_file_path = options.stats_fn
+        elif options.stats_fn:
+            stat_file_path = os.path.join(dir, output_dir, options.stats_fn)
+        else:
+            stat_file_path = None
+
+        if options.summary_fn:
+            out_file_path = os.path.join(dir, options.summary_fn)
+        else:
+            out_file_path = None
+        out_file_path_2 = os.path.join(dir, options.power_fn)
+        if not os.path.exists(config_file_path):
+            warning("config file does not exist:%s" % (config_file_path))
+        if stat_file_path and not os.path.exists(stat_file_path):
+            warning("stat path does not exist:%s" % (stat_file_path))
+        parseSystemConfig(config_file_path, stat_file_path, out_file_path, out_file_path_2, component_hash, stats_hash)
+
+'''
+genId will take a list of system components and concat
+them to make a specific component of stat identifier.
+'''
+def genId(id_list):
+    res=''
+    for id in id_list:
+        res += '%s.' %(id)
+
+    res = res.rstrip('.')
+    return res
+
+def tryGrabComponentStat(component, stat, conversion="int"):
+    try:
+        value=str(component.statistics[stat])
+    except:
+        value="0"
+
+    if conversion=="int":
+        value=int(value)
+    elif conversion=="float":
+        value=float(value)
+    else:
+        panic("unable to perform conversion", 8)
+    return value
+
+
+
+
+
+'''
+generateCalcStats is a function used to:
+(1) add statistics that are composed from several other statistics and params that
+can be seen by the translator objects in the next phase.
+(2) rename newly generated components to meet the McPat specifications
+(3) move children components to a new parent component to meet the right xml form
+This code is the least generic and will likely needed to be changed by new users.
+If there is a bug, it probably in this function ... X_X
+'''
+def generateCalcStats(cht, sht):
+    global options
+    num_cores=0
+    num_l1s=0
+    num_l2s=0
+    num_l3s=0
+    num_nocs=0
+    clock_rate=0
+    o3_cpu_exists=False
+    timing_cpu_exists=False
+    homogeneous_cores="0"
+    homogeneous_L2s="0"
+    homogeneous_L3s="0"
+    homogeneous_L1s="0"
+    homogeneous_L2Directories="0"
+    homogeneous_L1Directories="0"
+    homogeneous_nocs="0"
+    num_cache_levels=0
+    new_components_to_add=[]
+    components_to_remove=[]
+    fastest_clock=None
+
+    for c_key in cht:
+        #grab generic component info
+        component = cht[c_key]
+        if not component.params.has_key('type'):
+            continue
+        params = component.params
+        ptype = params['type']
+        component_name = component.name
+
+        if ("server" in c_key and options.system_name != "server") or ("client" in c_key and options.system_name != "client"):
+            component.power_xml_filter=True
+
+        #add subcomponents to different major components.
+        if ptype == 'AlphaTLB':
+            data_hits = tryGrabComponentStat(component, "data_hits", conversion="int")
+            data_misses= tryGrabComponentStat(component, "data_misses", conversion="int")
+            fetch_hits= tryGrabComponentStat(component, "fetch_hits", conversion="int")
+            fetch_misses=tryGrabComponentStat(component, "fetch_misses", conversion="int")
+            write_hits=tryGrabComponentStat(component, "write_hits", conversion="int")
+            write_misses=tryGrabComponentStat(component, "write_misses", conversion="int")
+            read_hits=tryGrabComponentStat(component, "read_hits", conversion="int")
+            read_misses=tryGrabComponentStat(component, "read_misses", conversion="int")
+            component.statistics["total_accesses"] = str(data_hits+ data_misses + fetch_hits + fetch_misses)
+            component.statistics["write_accesses"] = str(write_hits+write_misses)
+            component.statistics["read_accesses"] = str(read_hits+read_misses)
+
+        if ptype == 'Bus' or ptype == "BusConn":
+
+            num_ports=len(component.params['port'].split())
+            for pair in options.interconn_names.split('#'):
+                name, util = pair.split(',')
+                if name in component.name:
+                    component.re_name = component.name.replace(name, "noc%s"%num_nocs)
+                    component.re_id = component.id.replace(name, "NoC%s"%num_nocs)
+                    num_nocs = str(int(num_nocs)+1)
+                    break
+            cpu_clock_rate = int(1/(float(params['clock'])*1e-6))
+            component.params["clockrate"] = str(cpu_clock_rate)
+            component.params["input_ports"] = str(num_ports)
+            component.params["output_ports"] = str(num_ports)
+            bus_name = component_name
+            ports = params['port'].split()
+            for port in ports:
+                #remove port name to find component this bus is attached to
+                temp = port.split('.')
+                comp_id = genId(temp[0:len(temp)-1])
+
+                if not cht.has_key(comp_id):
+                    panic("unable to find component: %s" % (comp_id), 1)
+
+                #add the bus width to the component to make it easier for the power model
+                cht[comp_id].params[bus_name + ".width"] = params['width']
+
+        if ptype == 'Mesh2D':
+            for pair in options.interconn_names.split('#'):
+                name, util = pair.split(',')
+                if name in component.name:
+                    component.re_name = component.name.replace(name, "noc%s"%num_nocs)
+                    component.re_id = component.id.replace(name, "NoC%s"%num_nocs)
+                    homogeneous_nocs = str(int(num_nocs)+1)
+                    break
+            cpu_clock_rate=int(1/(float(params['clock'])*1e-6)) # 1/(tick_per_period*1e-12*1e6)
+            component.params["clockrate"] = str(cpu_clock_rate)
+            component.params["topology"] = "2Dmesh"
+            num_ports=len(component.params['port'].split())
+            component.params["horizontal_nodes"] = str(int(math.sqrt(num_ports))) #Makes assumption about the topology being near square like
+            component.params["vertical_nodes"] = str(int(math.ceil(num_ports/float(component.params["horizontal_nodes"])))) #square like topology examinations
+            component.params["has_global_link"] = "0" #FIXME: what is this?
+            component.params["link_latency"] = "1"
+            component.params["link_throughput"] = "1"
+            component.params["input_ports"] = str(num_ports)
+            component.params["output_ports"] = str(num_ports)
+            component.params["flit_bits"] = str()
+            component.statistics["total_routing_counts"] = 0
+            for stat_key in component.statistics:
+                if "routing_counts" in stat_key:
+                    stat = component.statistics[stat_key]
+                    component.statistics["total_routing_counts"] += int(stat)
+            component.statistics["total_routing_counts"] = str(component.statistics["total_routing_counts"])
+
+        #how many cores are there
+        if options.cpu_name in component_name and (ptype == "DerivO3CPU" or ptype == "TimingSimpleCPU" or ptype == "AtomicSimpleCPU"):
+            clock=int(component.params['clock'])
+            if fastest_clock == None or fastest_clock > clock:
+                fastest_clock=clock
+            num_cores += 1
+            if num_cores > 1:
+                homogeneous_cores="0"
+            # ASSUMPTION: ticks are picoseconds and converting to MHz
+            cpu_clock_rate=int(1/(float(params['clock'])*1e-6))
+            if "DerivO3CPU" == ptype:
+                o3_cpu_exists=True
+            elif "TimingSimpleCPU" == ptype:
+                timing_cpu_exists=True
+            # ASSUMPTION: only timingSimpleCPU and O3CPU will be used
+            #if o3_cpu_exists and timing_cpu_exists:
+            #    homogeneous_cores="0"
+            component.params["clockrate"] = str(cpu_clock_rate)
+            if ptype == "TimingSimpleCPU":
+                #move components to the detail_cpu from the cpu like the cache
+                match = re.match(r"%s.%s([\.0-9a-zA-z_:]+)"%(options.system_name, options.cpu_name), component.id)
+                if  match:
+                    new_id = "%s.cpu%s" %(options.system_name, match.group(1))
+                else:
+                    new_id = "%s.cpu" %(options.system_name)
+                #homogeneous system needs only one core identification
+                if  not cht.has_key(component.id):
+                    panic("cht does not have the key I generated for detailed cpu:%s" %(new_id),3)
+                new_component = cht[new_id]
+                if new_component.params.has_key('children'):
+                    removed_children=["dcache","icache"]
+                    for child in new_component.params['children'].split():
+                        if child == "dcache" or child == "icache":
+                            child_id = "%s.%s" %(new_id, child)
+                            if not cht.has_key(child_id):
+                                panic("child_id %s does not exist." %(child_id),4)
+                            cht[child_id].id="%s.%s" % (component.id, child)
+                            component.children.append(cht[child_id])
+
+                    rm_list=[]
+                    for ch in new_component.children:
+                        if ch.name in removed_children:
+                            rm_list.append(ch)
+                    for rm_i in rm_list:
+                        new_component.children.remove(rm_i)
+
+                #add BTB  unit
+                child_id=component.id+".BTB"
+                new_params={}
+                new_params["BTB_config"] = "%s,4,2,1,1,3" % ("8192")#FIXME: not enough
+                new_comp=Translator.createComponent(child_id, new_params)
+
+                new_comp.re_name=new_comp.name.replace(options.cpu_name, "core")
+                new_comp.re_id=new_comp.id.replace(options.cpu_name, "core")
+                new_comp.statistics["total_accesses"] = "0"#component.statistics["BPredUnit.lookups"]
+                new_comp.statistics["total_hits"] = "0"#component.statistics["BPredUnit.BTBHits"]
+                new_comp.statistics["total_misses"] = '0'#str(int(component.statistics["BPredUnit.lookups"]) - int(component.statistics["BPredUnit.BTBHits"]))
+                new_components_to_add.append((child_id,new_comp))
+                component.children.append(new_comp)
+
+                child_id=component.id+".predictor"
+                new_params={}
+                #new_params["local_predictor_size"] = "10,3" #FIXME: Where to grab this information
+                #new_params["local_predictor_entries"] = "1024"
+                #new_params["global_predictor_entries"] = "4096" #FIXME
+                #new_params["global_predictor_bits"] = "2" #FIXME
+                #new_params["chooser_predictor_entries"] = "4096" #FIXME
+                #new_params["chooser_predictor_bits"] = "2" #FIXME
+                #new_params["prediction_width"] = "1"
+                new_comp=Translator.createComponent(child_id, new_params, "PBT")
+                new_comp.re_name=new_comp.name.replace(options.cpu_name, "core")
+                new_comp.re_id=new_comp.id.replace(options.cpu_name, "core")
+                new_components_to_add.append((child_id,new_comp))
+                component.children.append(new_comp)
+
+            if ptype == "DerivO3CPU":
+                issue_width = int(component.params["issueWidth"])
+                component.params["ALU_per_core"] = str(int(math.ceil(issue_width)))
+                component.params["fp_issue_width"] = str(int(math.ceil(2/3.0*issue_width)))
+                component.params["MUL_per_core"] = str(int(math.ceil(1/3.0*issue_width)))
+                component.params["FPU_per_core"] = str(int(math.ceil(2/3.0*issue_width)))
+                component.params["instruction_buffer_size"] = "16"#str(int(math.ceil(16/3.0*issue_width)))
+                component.params["decoded_stream_buffer_size"] = str(int(math.ceil(8/3.0*issue_width)))
+                component.params["memory_ports"] = str(int(math.ceil(1/3.0*issue_width)))
+
+
+
+                component.statistics["fp_instructions"] = str(tryGrabComponentStat(component, "iq.FU_type_0::FloatAdd", conversion="int")  + \
+                                                          tryGrabComponentStat(component, "iq.FU_type_0::FloatCmp", conversion="int")  + \
+                                                          tryGrabComponentStat(component, "iq.FU_type_0::FloatCvt", conversion="int")  + \
+                                                          tryGrabComponentStat(component, "iq.FU_type_0::FloatMult", conversion="int") + \
+                                                          tryGrabComponentStat(component, "iq.FU_type_0::FloatDiv", conversion="int")  + \
+                                                          tryGrabComponentStat(component, "iq.FU_type_0::FloatSqrt", conversion="int"))
+                component.statistics["int_instructions"] =  str(tryGrabComponentStat(component, "iq.FU_type_0::No_OpClass", conversion="int") + \
+                                                            tryGrabComponentStat(component, "iq.FU_type_0::IntAlu", conversion="int") + \
+                                                            tryGrabComponentStat(component, "iq.FU_type_0::IntMult", conversion="int") + \
+                                                            tryGrabComponentStat(component, "iq.FU_type_0::IntDiv", conversion="int") + \
+                                                            tryGrabComponentStat(component, "iq.FU_type_0::IprAccess", conversion="int"))
+                try:
+                    component.statistics["committed_int_instructions"] = str(int(float(component["int_instructions"])\
+                                                                /(float(component["int_instructions"])+float(component["fp_instructions"]))\
+                                                                *int(component["commit:count"])))
+                    component.statistics["committed_fp_instructions"] = str(int(float(component["fp_instructions"])\
+                                                                /(float(component["int_instructions"])+float(component["fp_instructions"]))\
+                                                                *int(component["commit.count"])))
+                except:
+                    component.statistics["committed_int_instructions"] = "0"
+                    component.statistics["committed_fp_instructions"] = "0"
+                component.statistics["load_instructions"] = str(tryGrabComponentStat(component, "iq.FU_type_0::MemRead", conversion="int") + \
+                                                            tryGrabComponentStat(component, "iq.FU_type_0::InstPrefetch", conversion="int"))
+                component.statistics["store_instructions"] = str(tryGrabComponentStat(component, "iq.FU_type_0::MemWrite", conversion="int"))
+                component.statistics["num_busy_cycles"] = str(tryGrabComponentStat(component, "numCycles", conversion="int") - tryGrabComponentStat(component, "idleCycles", conversion="int"))
+                #add branch predictor child:
+                child_id=component.id+".predictor"
+                new_params={}
+                new_params["local_predictor_size"] = "10,3" #FIXME: Where to grab this information
+                new_params["local_predictor_entries"] = component.params["localPredictorSize"]
+                new_params["global_predictor_entries"] = component.params["globalPredictorSize"] #FIXME
+                new_params["global_predictor_bits"] = "2" #FIXME
+                new_params["chooser_predictor_entries"] = component.params["choicePredictorSize"] #FIXME
+                new_params["chooser_predictor_bits"] = "2" #FIXME
+                new_params["prediction_width"] = "1"
+                new_comp=Translator.createComponent(child_id, new_params, "PBT")
+                new_comp.re_name=new_comp.name.replace(options.cpu_name, "core")
+                new_comp.re_id=new_comp.id.replace(options.cpu_name, "core")
+                new_components_to_add.append((child_id,new_comp))
+                component.children.append(new_comp)
+
+                #move components to the detail_cpu from the cpu like the cache
+                match = re.match(r"%s.%s([\.0-9a-zA-z_:]+)"%(options.system_name, options.cpu_name), component.id)
+                if match:
+                    new_id = "%s.cpu%s" %(options.system_name,match.group(1))
+                else:
+                    new_id = "%s.cpu" %(options.system_name)
+                #homogeneous system needs only one core identification
+                if  not cht.has_key(component.id):
+                    panic("cht does not have the key I generated for detailed cpu:%s" %(new_id),3)
+                new_component = cht[new_id]
+                if new_component.params.has_key('children'):
+                    removed_children=["dcache","icache"]
+                    for child in new_component.params['children'].split():
+                        if child == "dcache" or child == "icache":
+                            child_id = "%s.%s" %(new_id, child)
+                            if not cht.has_key(child_id):
+                                panic("child_id %s does not exist." %(child_id),4)
+                            cht[child_id].id="%s.%s" % (component.id, child)
+                            component.children.append(cht[child_id])
+                    for ch in new_component.children:
+                        if ch.name in removed_children:
+                            new_component.children.remove(ch)
+
+                #add BTB  unit
+                child_id=component.id+".BTB"
+                new_params={}
+                new_params["BTB_config"] = "%s,4,2,1,1,3" % (component.params["BTBEntries"])#FIXME: not enough
+                new_comp=Translator.createComponent(child_id, new_params)
+
+                new_comp.re_name=new_comp.name.replace(options.cpu_name, "core")
+                new_comp.re_id=new_comp.id.replace(options.cpu_name, "core")
+                new_comp.statistics["total_accesses"] = str(tryGrabComponentStat(component, "BPredUnit.lookups", conversion="int"))
+                new_comp.statistics["total_hits"] = str(tryGrabComponentStat(component, "BPredUnit.BTBHits", conversion="int"))
+                new_comp.statistics["total_misses"] = str(tryGrabComponentStat(component, "BPredUnit.lookups", conversion="int") - tryGrabComponentStat(component, "BPredUnit.BTBHits", conversion="int"))
+                new_components_to_add.append((child_id,new_comp))
+                component.children.append(new_comp)
+
+        if ptype == "BaseCache":
+            try:
+                banked  = component.params["banked"]
+                num_banks = component.params["numBanks"]
+            except:
+                banked = "false"
+                num_banks=1
+            num_mshrs=int(component.params["mshrs"])
+            if num_mshrs < 4:
+                num_mshrs=4
+            component.params["buffer_sizes"]= "%d,%d,%d,%d" % (num_mshrs,num_mshrs,num_mshrs,num_mshrs)
+            size = component.params["size"]
+            block_size = component.params["block_size"]
+            assoc = component.params["assoc"]
+            if banked == "false":
+                banked="0"
+                num_banks="1"
+            else:
+                banked="1"
+
+            if "icache" in component_name or "dcache" in component_name:
+                temp = component.id.split('.')
+                core_component = temp[0]+'.'+temp[1]
+                latency_wrt_core = str(int(math.ceil(float(component.params["latency"])/float(cht[core_component].params["clock"]))))
+                if "icache" in component_name:
+                    cache_config_type="icache_config"
+                else:
+                    cache_config_type="dcache_config"
+                component.params[cache_config_type] = "%s,%s,%s,%s,%s,%s" % (size, block_size, assoc, num_banks, "1", latency_wrt_core) #TODO: set throughput w.r.t core clock
+            #add l2 directory
+            if ("l2" in component_name) or ("l3" in component_name):
+                component.re_name=component.name.replace("l","L")
+                component.re_id=component.id.replace("l","L")
+                match = re.match(r".*(l[0-9])([0-9]*)", component_name)
+                cache_qualifier=match.group(1).upper()
+                new_cache_qualifier=None
+                if "l3" in component_name:
+                    new_cache_qualifier=cache_qualifier.replace("L3","L2")
+                else:
+                    new_cache_qualifier=cache_qualifier.replace("L2","L1")
+                cache_number='0'
+                if match.group(2) != '':
+                    cache_number=match.group(2)
+                else:
+                    component.re_name=component.re_name+cache_number
+                    component.re_id=component.re_id+cache_number
+                child_id="%s.%sDirectory%s" % (options.system_name, new_cache_qualifier, cache_number)
+                core_component="%s.%s0"%(options.system_name, options.cpu_name)
+                if not cht.has_key(core_component):
+                    core_component="%s.%s00"%(options.system_name, options.cpu_name)
+                    if not cht.has_key(core_component):
+                        core_component ="%s.%s"%(options.system_name, options.cpu_name)
+
+
+                new_params={}
+                new_params["clockrate"] = str(int(1/(float(component.params["latency"])*1e-6)))
+                dir_size = str(int(float(size)/float(block_size)))
+                latency_wrt_core = str(int(math.ceil(float(component.params["latency"])/float(cht[core_component].params["clock"]))))
+                dir_block_size=block_size
+                dir_number_banks=num_banks
+                if "l2" in component_name:
+                    dir_block_size="16" #block_size of 64 causes problems for L1Directory so I hardcoded 16
+                    dir_number_banks="1" #bank_size not equal to 1 causes problems for the L1DIrectory.
+
+                new_params["Dir_config"] = "%s,%s,%s,%s,%s,%s" % (dir_size,dir_block_size,assoc,dir_number_banks,"1", latency_wrt_core)#TODO: set throughput w.r.t core clock,
+                new_comp=Translator.createComponent(child_id, new_params)
+                new_comp.params["clockrate"] = str(int(1/(float(component.params["latency"])*1e-6)))
+                try:
+                    new_comp.statistics["read_accesses"] = str(int(component["directory_transactions::Shared_ReadMiss_1"]) + \
+                                                          int(component["directory_transactions::Uncached_ReadMiss_3"]) + \
+                                                          int(component["directory_transactions::Modified_ReadMiss_5"]))
+                                                          #component.statistics["directory_transactions::Internal_Shared_Fetch_11"] + \
+                                                          #component.statistics["directory_transactions::Internal_Modified_Fetch_10"]
+                    new_comp.statistics["write_accesses"] = str(int(component["directory_transactions::Shared_ReadExMiss_0"]) + \
+                                                            int(component["directory_transactions::Uncached_ReadExMiss_4"]) + \
+                                                            int(component["directory_transactions::Modified_ReadExMiss_6"]))
+                                                          #component.statistics["directory_transactions::Shared_Invalidate_2"] + \
+                                                          #component.statistics["directory_transactions::Modified_WritebackInvalidate_7"] + \
+                                                          #component.statistics["directory_transactions::Internal_Shared_Invalidate_8"] + \
+                                                          #component.statistics["directory_transactions::Internal_Modified_Invalidate_9"]
+                except:
+                    new_comp.statistics["read_accesses"] = "0"
+                    new_comp.statistics["write_accesses"] = "0"
+
+                new_components_to_add.append((child_id,new_comp))
+                cht[options.system_name].children.append(new_comp)
+                component.params["%s_config"%(cache_qualifier)] = "%s,%s,%s,%s,%s,%s" % (size, block_size, assoc, num_banks, "1", latency_wrt_core) #TODO: set throughput w.r.t core clock
+                component.params["buffer_sizes"]= "%s,%s,%s,%s" % (component.params["mshrs"], component.params["mshrs"], component.params["mshrs"], component.params["mshrs"])
+                component.params["clockrate"] = str(int(1/(float(component.params["latency"])*1e-6)))
+
+
+        if "physmem" in component_name and options.system_name in component.id:
+                component.re_name=component.name.replace("physmem","mem")
+                component.re_id=component.id.replace("physmem","mem")
+                # add some stats:
+                try:
+                    component.statistics["num_phys_mem_accesses"] = str(int(component["num_phys_mem_reads"]) \
+                                    + int(component["num_phys_mem_writes"]))
+                except:
+                    component.statistics["num_phys_mem_accesses"] = "0"
+
+
+                child_id="%s.mc" %(options.system_name)
+                new_params={}
+                new_params["mc_clock"] = str(int(1/(float(component.params["latency"])*1e-6)))
+                new_comp=Translator.createComponent(child_id, new_params)
+                new_components_to_add.append((child_id,new_comp))
+                cht[options.system_name].children.append(new_comp)
+                try:
+                    new_comp.statistics["num_phys_mem_accesses"] = str(int(component["num_phys_mem_accesses"]))
+                    new_comp.statistics["num_phys_mem_reads"] = str(int(component["num_phys_mem_reads"]))
+                    new_comp.statistics["num_phys_mem_writes"] = str(int(component["num_phys_mem_writes"]))
+                except:
+                    new_comp.statistics["num_phys_mem_accesses"] = "0"
+                    new_comp.statistics["num_phys_mem_reads"] = "0"
+                    new_comp.statistics["num_phys_mem_writes"] = "0"
+
+
+        # The following three if statements all assume that if there's only one
+        # cache in a hierarchy it's cache used for data and instructions. For
+        # directories of cache coherency protocols its switches from shared to
+        # exclusive directories if there is more than one cache in the next
+        # higher hierarchy.
+
+        if ptype == "BaseCache" and ("dcache" in component_name or "icache" in component_name):
+            if num_cache_levels < 1:
+                num_cache_levels = 1
+            num_l1s += 1
+            if num_l1s ==1:
+                homogeneous_L1s="1"
+            elif num_l1s > 1:
+                homogeneous_L1s="0"
+
+        if ptype == "BaseCache" and "l2" in component_name:
+            if num_cache_levels < 2:
+                num_cache_levels = 2
+            num_l2s +=1
+            if num_l2s ==1:
+                homogeneous_L1Directories="1"
+                homogeneous_L2s="1"
+            elif num_l2s > 1:
+                homogeneous_L1Directories="0"
+                homogeneous_L2s="0"
+        if ptype == "BaseCache" and "l3" in component_name:
+            if num_cache_levels < 3:
+                num_cache_levels = 3
+            num_l3s +=1
+            if num_l3s ==1:
+                homogeneous_L2Directories="1"
+                homogeneous_L3s="1"
+            elif num_l3s > 1:
+                homogeneous_L2Directories="0"
+                homogeneous_L3s="0"
+
+
+    # Add a fake NIC
+    niu_id = "%s.niu" %(options.system_name)
+    niu = Translator.createComponent(niu_id, {})
+    new_components_to_add.append((niu_id,niu))
+    cht[options.system_name].children.append(niu)
+
+    # Add a fake PCI Express Controller
+    pcie_id = "%s.pcie" %(options.system_name)
+    pcie = Translator.createComponent(pcie_id, {})
+    new_components_to_add.append((pcie_id, pcie))
+    cht[options.system_name].children.append(pcie)
+
+    # Add a fake Flash Controller
+    flash_id = "%s.flashc" %(options.system_name)
+    flash = Translator.createComponent(flash_id, {})
+    new_components_to_add.append((flash_id, flash))
+    cht[options.system_name].children.append(flash)
+
+    for key_id, new_comp in new_components_to_add:
+        cht[key_id]=new_comp
+
+    # add calculated statistics
+    tick_key = "%s.sim_ticks"%(options.system_name)
+    if tick_key in sht:
+        cht[options.system_name].statistics["total_cycles"] = str(int(sht[tick_key])/int(fastest_clock))
+    cht[options.system_name].params["number_of_cores"] = str(num_cores)
+    cht[options.system_name].params["number_of_L1Directories"] = str(num_l2s)
+    cht[options.system_name].params["number_of_L2s"] = str(num_l2s)
+    cht[options.system_name].params["number_of_L2Directories"] = str(num_l3s)
+    cht[options.system_name].params["number_of_L3s"] = str(num_l3s)
+    cht[options.system_name].params["number_of_nocs"] = str(num_nocs)
+    cht[options.system_name].params["homogeneous_cores"] = homogeneous_cores
+    cht[options.system_name].params["number_cache_levels"] = str(num_cache_levels)
+    cht[options.system_name].params["homogeneous_L2s"] = homogeneous_L2s
+    cht[options.system_name].params["homogeneous_L3s"] = homogeneous_L3s
+    cht[options.system_name].params["homogeneous_L1Directories"] = homogeneous_L1Directories
+    cht[options.system_name].params["homogeneous_L2Directories"] = homogeneous_L2Directories
+    cht[options.system_name].params["number_of_dir_levels"] = str(num_cache_levels-1)
+    cht[options.system_name].params["homogeneous_nocs"] = homogeneous_nocs
+
+
+'''
+createComponentTree() does the following:
+(1) creates a tree of components by looking at the config.ini
+parameter children for each component.
+(2) stats are added to each component as appropriate.
+(3) missing stats are generated.
+(4) component translator is set
+(5) the translator grabs all relevant stats and params for
+the component and renames from M5 names to McPat names
+'''
+def createComponentTree(cht, sht):
+    #create a component tree by looking at the children parameter
+    for c_key in cht:
+        component = cht[c_key]
+        if component.params.has_key('children'):
+            for child in component.params['children'].split():
+                if c_key == "root":
+                    child_id = child
+                else:
+                    child_id = "%s.%s" %(component.id, child)
+                if not cht.has_key(child_id):
+                    panic("child_id %s does not exist." %(child_id),5)
+                component.children.append(cht[child_id])
+
+    #add all statistics to right component
+    for stat_key in sht:
+        #find the longest prefix that matches a component id
+        stat = sht[stat_key]
+        temp = stat_key.split('.')
+        num_fields = len(temp)
+        prefix_id = None
+
+        for x in xrange(num_fields, 0, -1):
+            prefix_id = genId(temp[0:x])
+            if cht.has_key(prefix_id):
+                break
+
+        #add the statistic to the right component
+        stat_id = genId(temp[x:num_fields])
+        if len(stat_id) < 1:
+            panic("error: parsed invalid stat.",6)
+
+        #for all those stats that don't have a component, add it to root component
+        if not cht.has_key(prefix_id):
+            prefix_id="root"
+            stat_id = genId(temp)
+
+        component = cht[prefix_id]
+        component.statistics[stat_id] = stat
+
+    #filter out unwanted component info in power.xml
+    for key in cht:
+        cur_component=cht[key]
+        cur_component.checkToFilter()
+        cur_component.checkToRenameReid()
+
+    # generate calculated statistics
+    generateCalcStats(cht, sht)
+
+    #set component types
+    for id in cht:
+        component = cht[id]
+        setComponentType(component)
+        if (component.translator != Component.UNKNOWN):
+            component.translator.translate_params(component)
+            component.translator.translate_statistics(component)
+
+'''
+genComponentXml is responsible for generating summary.xml,
+the intermediate form for power.xml
+'''
+def genComponentXml(root_component, out_path):
+    import xml.dom.minidom
+    global options
+    doc = xml.dom.minidom.Document()
+
+    root_component.formXml(doc ,doc)
+    if options.verbose:
+        print "writing:%s" %(out_path)
+    f = open(out_path, 'w')
+    f.write(doc.toprettyxml())
+    f.close()
+
+'''
+genPowerXml is responsible for generating power.xml,
+the interface for McPat
+'''
+def genPowerXml(root_component, out_path):
+    import xml.dom.minidom
+    global options
+    doc = xml.dom.minidom.Document()
+
+    root_component.selectChildrenForXmlInclusion()
+
+    contentCreators = [ 'create' + c[0].upper() + c[1:] for c in options.power_output.split(',') ]
+
+    root_component.formXmlPower(doc, doc, contentCreators)
+    if options.verbose:
+        print "writing:%s" %(out_path)
+    f = open(out_path, 'w')
+    f.write(doc.toprettyxml())
+    f.close()
+
+'''
+sanityCheckTree is currently just checking if there is a timing or detailed cpu
+model in the tree, otherwise a power XML file without a CPU would be generated.
+'''
+def sanityCheckTree(root_component):
+    from re import match
+    # Recurse through the tree and look if there is a CPU that is not excluded
+    # from the power XML file.
+    def walkTree(root_component):
+        for child in root_component.children:
+            if match('cpu[0-9]*', child.name) and not child.power_xml_filter:
+                return True
+            if walkTree(child):
+                return True
+    if not walkTree(root_component):
+        print "Could not find a CPU suitable for inclusion into the power XML file (make sure you use a timing or detailed model in M5)."
+        return False
+    return True
+
+'''
+parseSystemConfig is repsonsible for creating a component dictionary, a statisitic dictionary, and
+then using this two structures to build a an internal tree of component objects that contain
+fields with their parameters and statistics.
+@config_file_path string to the config.ini file
+@stats_file_path string to the stat file path
+@out_file_path path to put the summary.xml file that is the intermediate of the power.xml file
+@out_file_path_2 path to put the power.xml file
+@cht dictionary that contains all component keys and their associated objects.
+@sht dictionary that contains all stat keys and their associated stat objects.
+'''
+def parseSystemConfig(config_file_path, stats_file_path, out_file_path, out_file_path_2, cht, sht):
+    ##parse the configuration
+
+    f = open(config_file_path, 'r')
+    id = None #the id of current system component
+    params = {} #params set for the current config
+
+    #add all the components to the dictionary
+    for line in f:
+
+        #look for a new param id
+        if '[' in line and ']' in line and '=' not in line:
+            id = line.rstrip().rstrip(']').lstrip('[')
+            if  cht.has_key(id):
+                panic("Identical component id occurs twice! Invalid Config",7)
+
+        #find params for id
+        elif id:
+            temp = line.split('=')
+            #assume that a newline or line without an = is the beginning of the next component
+            if len(temp) == 0 or len(temp) == 1:
+                cht[id]=Translator.createComponent(id, params)
+                params = {}
+                id = None
+            #grab the param
+            else:
+                if len(temp) != 2:
+                    warning("A param with more than one '=' occurred: %s. parts=%d" %(line, len(temp)))
+                params[temp[0]]=temp[1].rstrip()
+
+    #add all the statistics to the dictionary
+    if stats_file_path:
+        g = open(stats_file_path, 'r')
+        for line in g:
+            #print line
+            match = re.match("(%s[\.0-9a-zA-z_:]*)\s+([\w\.]+)\s+"%(options.system_name), line)
+            if match:
+                sht[match.group(1)] = match.group(2)
+                continue
+
+            #match = re.match(r"(client[\.0-9a-zA-z_:]*)\s+([\w\.]+)\s+", line)
+            #if match:
+            #    #sht[match.group(1)] = match.group(2)
+            #    continue
+            #
+            #match = re.match(r"(server[\.0-9a-zA-z_:]*)\s+([\w\.]+)\s+", line)
+            #if match:
+            #    #sht[match.group(1)] = match.group(2)
+            #    continue
+
+            match = re.match(r"(global[\.0-9a-zA-z_:]*)\s+([\w\.]+)\s+", line)
+            if  match:
+                sht[match.group(1)] = match.group(2)
+                continue
+
+            match = re.match(r"([\.0-9a-zA-z_:]*)\s+([\w\.]+)\s+", line)
+            if  match:
+                sht["%s."%(options.system_name)+match.group(1)] = match.group(2)
+                #sht[match.group(1)] = match.group(2)
+                continue
+
+    #put all the components into a tree
+    createComponentTree (cht, sht)
+
+    #do some sanity checking instead of risk generating broken XML files.
+    if not sanityCheckTree(cht['root']):
+        panic('Unable to generate a valid power XML file from given M5 system configuration!', 1)
+
+    #generate the intermediate xml summary.xml
+    if out_file_path:
+        genComponentXml(cht['root'], out_file_path)
+    #generate the McPat power.xml
+    genPowerXml(cht['root'], out_file_path_2)
+
+def checkArgs():
+    if not len(options.power_output):
+        panic("--power-output requires a non-zero argument (see --help output).")
+
+def main ():
+    global options, args
+
+    # TODO: Do something more interesting here...
+    if options.verbose:
+        print 'm5-mcpat-parse.py'
+        print '...'
+
+    if options.asisa:
+        options.old_m5_stats = True
+        options.cpu_name = "detail_cpu"
+        options.stats_fn = "stats2.txt"
+        options.config_fn = "config2.ini"
+        options.mem_tech_node = "65"
+        options.core_tech_node = "65"
+        options.core_device_type = "0" #HIGH PERFORMANCE
+        options.cache_device_type = "0" #HIGH PERFORMANCE DEVICE TYPE
+        options.interconnect_projection_type = "0"
+    if options.asisa65:
+        tech_node="65"
+        options.old_m5_stats = True
+        options.cpu_name = "detail_cpu"
+        options.stats_fn = "stats2.txt"
+        options.config_fn = "config2.ini"
+        options.mem_tech_node = "%s"%(tech_node)
+        options.core_tech_node = "%s"%(tech_node)
+        options.core_device_type = "0" #HIGH PERFORMANCE
+        options.cache_device_type = "0" #HIGH PERFORMANCE DEVICE TYPE
+        options.interconnect_projection_type = "0"
+        options.summary_fn="summary_%snm.xml"%(tech_node)
+        options.power_fn="power_%snm.xml"%(tech_node)
+    if options.asisa45:
+        tech_node="45"
+        options.old_m5_stats = True
+        options.cpu_name = "detail_cpu"
+        options.stats_fn = "stats2.txt"
+        options.config_fn = "config2.ini"
+        options.mem_tech_node = "%s"%(tech_node)
+        options.core_tech_node = "%s"%(tech_node)
+        options.core_device_type = "0" #HIGH PERFORMANCE
+        options.cache_device_type = "0" #HIGH PERFORMANCE DEVICE TYPE
+        options.interconnect_projection_type = "0"
+        options.summary_fn="summary_%snm.xml"%(tech_node)
+        options.power_fn="power_%snm.xml"%(tech_node)
+    if options.asisa32:
+        tech_node="32"
+        options.old_m5_stats = True
+        options.cpu_name = "detail_cpu"
+        options.stats_fn = "stats2.txt"
+        options.config_fn = "config2.ini"
+        options.mem_tech_node = "%s"%(tech_node)
+        options.core_tech_node = "%s"%(tech_node)
+        options.core_device_type = "0" #HIGH PERFORMANCE
+        options.cache_device_type = "0" #HIGH PERFORMANCE DEVICE TYPE
+        options.interconnect_projection_type = "0"
+        options.summary_fn="summary_%snm.xml"%(tech_node)
+        options.power_fn="power_%snm.xml"%(tech_node)
+    if options.asisa22:
+        tech_node="22"
+        options.old_m5_stats = True
+        options.cpu_name = "detail_cpu"
+        options.stats_fn = "stats2.txt"
+        options.config_fn = "config2.ini"
+        options.mem_tech_node = "%s"%("32")
+        options.core_tech_node = "%s"%(tech_node)
+        options.core_device_type = "0" #HIGH PERFORMANCE
+        options.cache_device_type = "0" #HIGH PERFORMANCE DEVICE TYPE
+        options.interconnect_projection_type = "0"
+        options.summary_fn="summary_%snm.xml"%(tech_node)
+        options.power_fn="power_%snm.xml"%(tech_node)
+    elif options.qualcomm:
+        options.cpu_name = "switch_cpus"
+        options.stats_fn = "stats.txt"
+        options.config_fn = "config.ini"
+        options.mem_tech_node = "32"
+        options.core_tech_node = "32"
+        options.core_device_type = "2" #LOW POWER
+        options.cache_device_type = "2" #Low Power
+        options.interconnect_projection_type ="2" #LOW POWER
+    elif options.idlestudy:
+        options.interconn_names = "tol3bus,0.5"
+        options.old_m5_stats = False
+        options.cpu_name = "switch_cpus"
+        options.stats_fn = "stats.txt"
+        options.config_fn = "config.ini"
+        options.mem_tech_node = "32"
+        options.core_tech_node = "22"
+        options.core_device_type = "2" #LOW POWER
+        options.cache_device_type = "2" #LOW POWER
+        options.interconnect_projection_type = "2" #LOW POWER
+    elif options.idlestudy32_LOP:
+        tech_node="32"
+        options.interconn_names = "tol3bus,0.5"
+        options.old_m5_stats = False
+        options.cpu_name = "switch_cpus"
+        options.stats_fn = "stats.txt"
+        options.config_fn = "config.ini"
+        options.mem_tech_node = "%s"%("32")
+        options.core_tech_node = "%s"%(tech_node)
+        options.core_device_type = "2" #LOP
+        options.cache_device_type = "2" #LOP
+        options.interconnect_projection_type = "2"
+        options.summary_fn="summary_%snm_LOP.xml"%(tech_node)
+        options.power_fn="power_%snm_LOP.xml"%(tech_node)
+    elif options.idlestudy22_LOP:
+        tech_node="22"
+        options.interconn_names = "tol3bus,0.5"
+        options.old_m5_stats = False
+        options.cpu_name = "switch_cpus"
+        options.stats_fn = "stats.txt"
+        options.config_fn = "config.ini"
+        options.mem_tech_node = "%s"%("32")
+        options.core_tech_node = "%s"%(tech_node)
+        options.core_device_type = "2" #LOP
+        options.cache_device_type = "2" #LOP
+        options.interconnect_projection_type = "2" #LOP
+        options.summary_fn="summary_%snm_LOP.xml"%(tech_node)
+        options.power_fn="power_%snm_LOP.xml"%(tech_node)
+    elif options.idlestudy32_HP:
+        tech_node="32"
+        options.interconn_names = "tol3bus,0.5"
+        options.old_m5_stats = False
+        options.cpu_name = "switch_cpus"
+        options.stats_fn = "stats.txt"
+        options.config_fn = "config.ini"
+        options.mem_tech_node = "%s"%("32")
+        options.core_tech_node = "%s"%(tech_node)
+        options.core_device_type = "0" #HP
+        options.cache_device_type = "0" #HP
+        options.interconnect_projection_type = "0" #HP
+        options.summary_fn="summary_%snm_HP.xml"%(tech_node)
+        options.power_fn="power_%snm_HP.xml"%(tech_node)
+    elif options.idlestudy22_HP:
+        tech_node="22"
+        options.interconn_names = "tol3bus,0.5"
+        options.old_m5_stats = False
+        options.cpu_name = "switch_cpus"
+        options.stats_fn = "stats.txt"
+        options.config_fn = "config.ini"
+        options.mem_tech_node = "%s"%("32")
+        options.core_tech_node = "%s"%(tech_node)
+        options.core_device_type = "0" #HP
+        options.cache_device_type = "0" #HP
+        options.interconnect_projection_type = "0" #HP
+        options.summary_fn="summary_%snm_HP.xml"%(tech_node)
+        options.power_fn="power_%snm_HP.xml"%(tech_node)
+    elif options.idlestudy2:
+        options.interconn_names = "tol3bus,0.5"
+        options.old_m5_stats = False
+        options.cpu_name = "switch_cpus"
+        options.stats_fn = "stats.txt"
+        options.config_fn = "config.ini"
+        options.mem_tech_node = "45"
+        options.core_tech_node = "45"
+        options.core_device_type = "0" #HIGH PERF
+        options.cache_device_type = "0" #HIGH PERF
+        options.interconnect_projection_type = "0" #HIGH PERF
+
+
+    run()
+
+if __name__ == '__main__':
+    try:
+        start_time = time.time()
+        parser = optparse.OptionParser(
+                formatter=optparse.TitledHelpFormatter(),
+                usage=globals()['__doc__'],
+                version='TODO')
+        parser.add_option('-o', '--m5dir', action='store', type='string', default='m5out', help='m5 output directory (default: m5out)')
+        parser.add_option ('-v', '--verbose', action='store_true',
+                default=False, help='verbose output')
+        parser.add_option ('-f', '--process_run_dirs_by_filter', action='store',
+                default=None, help="process a series of run directories by some specificed filter string")
+        parser.add_option('--old_m5_stats', action="store_true", default=False, help='processing old m5 stats')
+        parser.add_option('-a', '--asisa', action='store_true', default=False, help='process asisa power')
+
+        parser.add_option('--asisa65', action='store_true', default=False, help='process asisa power 65')
+        parser.add_option('--asisa45', action='store_true', default=False, help='process asisa power 45')
+        parser.add_option('--asisa32', action='store_true', default=False, help='process asisa power 32')
+        parser.add_option('--asisa22', action='store_true', default=False, help='process asisa power 22')
+        parser.add_option('-q', '--qualcomm', action='store_true', default=False, help='process asisa power')
+        parser.add_option('-e', '--idlestudy', action='store_true', default=False, help='process idlestudy power assuming LOP circuits')
+        parser.add_option('--idlestudy22_LOP', action='store_true', default=False, help='process idlestudy power assuming LOP circuits 22nm')
+        parser.add_option('--idlestudy32_LOP', action='store_true', default=False, help='process idlestudy power assuming LOP circuits 32nm')
+        parser.add_option('--idlestudy22_HP', action='store_true', default=False, help='process idlestudy power assuming LOP circuits 22nm')
+        parser.add_option('--idlestudy32_HP', action='store_true', default=False, help='process idlestudy power assuming LOP circuits 32nm')
+        parser.add_option('--idlestudy2', action='store_true', default=False, help='process idlestudy power assuming HP circuits')
+        parser.add_option('-c', '--cpu_name', action='store', type='string', default="switch_cpus", help="the string used cpu comparisons")
+        parser.add_option('-s', '--stats_fn', action='store', type='string', default='stats.txt', help="the name of the stats file to use. Use -s /dev/stdin to read from stdin and --stats_fn= to skip stats.")
+        parser.add_option('-C', '--config_fn', action='store', type='string', default='config.ini', help="the name of the config file to use")
+        parser.add_option('-y', '--summary_fn', action='store', type='string', default='summary.xml', help="the name of the summary output file name. Use --summary_fn= to inhibit.")
+        parser.add_option('-p', '--power_fn', action='store', type='string', default='power.xml', help="the name of the McPAT config output file name. Use -p /dev/stdout to write to stdout.")
+        parser.add_option('-S', '--system_name', action='store', type='string', default='system', help="the name the system we are consider for stats")
+        parser.add_option('-l', '--l1_cache_cpu_name', action='store', type='string', default='cpu', help="the name of the cpu to which the l1 dcache and icache were first attached")
+        parser.add_option('-i', '--itb_name', action='store', type='string', default='itb', help="The name associated with M5's itb")
+        parser.add_option('-d', '--dtb_name', action='store', type='string', default='dtb', help="The name associated with M5's dtb")
+        parser.add_option('-I', '--interconn_names', action='store', type='string', default='tol2bus,0.5', help="The name of the interconnects to consider")
+        parser.add_option('-m', '--mem_tech_node', action='store', type='string', default='32', help="The technology node of the memory")
+        parser.add_option('-t', '--core_tech_node', action='store', type='string', default='32', help="The technology node of the core")
+        parser.add_option('-D', '--core_device_type', action='store', type='string', default='0', help="The core device type: 0=High Performance,1=Low Standby Power,2=Low Operating Power")
+        parser.add_option('-E', '--cache_device_type', action='store', type='string', default='0', help="The cache device type: 0=High Performance,1=Low Standby Power,2=Low Operating Power")
+        parser.add_option('-P', '--interconnect_projection_type', action='store', type='string', default='0', help="The cache device type: 0=High Performance,1=Low Standby Power,2=Low Operating Power")
+        parser.add_option('--sys_vdd_scale', action='store', type='string', default=None, help="The amount to scale vdd by in the system.")
+        parser.add_option('--do_vdd_scaling', action='store_true', default=False, help="The amount to scale vdd by in the system.")
+        parser.add_option('-O', '--power-output', action='store', type='string', default='systemConfig,systemStats', help="A comma separated list of output data the parser should include in the McPAT XML file. Currently supported operations are: systemConfig and systemStats. systemConfig creates the <param> entries and systemStats the <stat> entries. This configuration option is at the moment broken. -O systemStats does not generate a valid McPAT input file.")
+
+
+        #parser.add_options('-N', '--num_cores', action='store', type='int', default=1, help="The number of cores that must be processed.")
+        (options, args) = parser.parse_args()
+
+        checkArgs()
+
+        if options.verbose: print time.asctime()
+        exit_code = main()
+        if exit_code is None:
+            exit_code = 0
+        if options.verbose: print time.asctime()
+        if options.verbose: print 'TOTAL TIME IN MINUTES:',
+        if options.verbose: print (time.time() - start_time) / 60.0
+        sys.exit(exit_code)
+    except KeyboardInterrupt, e: # Ctrl-C
+        raise e
+    except SystemExit, e: # sys.exit()
+        raise e
+    except Exception, e:
+        print 'ERROR, UNEXPECTED EXCEPTION'
+        print str(e)
+        traceback.print_exc()
+        os._exit(1)
+
+# vim:set sr et ts=4 sw=4 ft=python : // See Vim, :help 'modeline'
